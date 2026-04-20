@@ -209,6 +209,11 @@ __marimo__/
 # Scrapyard runtime outputs
 output/
 logs/*.log
+*.db
+scraper_state.db
+
+# Environment / secrets
+.env
 
 # Playwright browser binaries
 playwright/.local-browsers/
