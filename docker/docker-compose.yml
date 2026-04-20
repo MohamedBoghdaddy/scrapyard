@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  # ── Scrapyard application ────────────────────────────────────────────────
+  scrapyard:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    environment:
+      - PLAYWRIGHT_WS=ws://browserless:3000
+    volumes:
+      - ../output:/app/output
+      - ../logs:/app/logs
+      - ../config:/app/config
+    depends_on:
+      - browserless
+    networks:
+      - scrapyard_net
+    # Override CMD at runtime:
+    #   docker compose run scrapyard --site egycarparts --format csv
+    command: ["--site", "egycarparts", "--format", "json"]
+
+  # ── Browserless (remote Chromium pool) ──────────────────────────────────
+  browserless:
+    image: browserless/chrome:latest
+    restart: unless-stopped
+    environment:
+      - TOKEN=${BROWSERLESS_TOKEN:-scrapyard_secret}
+      - CONCURRENT=${BROWSERLESS_CONCURRENT:-5}
+      - QUEUE_LENGTH=10
+      - EXIT_ON_HEALTH_FAILURE=true
+      - PRE_REQUEST_HEALTH_CHECK=true
+    ports:
+      - "3000:3000"
+    networks:
+      - scrapyard_net
+
+  # ── PostgreSQL (optional – for --format postgres) ────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-scrapyard}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-scrapyard}
+      - POSTGRES_DB=${POSTGRES_DB:-scrapyard}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - scrapyard_net
+
+networks:
+  scrapyard_net:
+    driver: bridge
+
+volumes:
+  pg_data:
