@@ -3,12 +3,20 @@ Scraper for Al Khaleeg auto parts (Arabic / WooCommerce-style site).
 
 Uses Playwright for JavaScript-rendered content and handles bilingual
 (Arabic/English) product data throughout.
+
+Browserless pool: if PLAYWRIGHT_WS is set, connects to a remote Browserless
+instance instead of launching a local Chromium browser.
+
+Content blocking detection: page content is scanned for bot-detection patterns
+after each navigation.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
 from bs4 import BeautifulSoup
 from playwright.async_api import (
@@ -31,19 +39,42 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
-# How long (ms) to wait for page elements / network idle
 NAV_TIMEOUT = 60_000
 LOAD_TIMEOUT = 30_000
+
+
+# ---------------------------------------------------------------------------
+# Blocking detection
+# ---------------------------------------------------------------------------
+
+_BLOCK_PATTERNS = [
+    re.compile(r"captcha|robot|challenge", re.I),
+    re.compile(r"access denied|forbidden", re.I),
+    re.compile(r"rate limit|too many requests", re.I),
+    re.compile(r"please verify you are a human", re.I),
+]
+
+
+def _is_page_blocked(content: str) -> bool:
+    """Return True when the page content matches a bot-detection pattern."""
+    sample = content[:3000]
+    return any(p.search(sample) for p in _BLOCK_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
 
 
 class AlKhaleegScraper(BaseScraper):
     """Playwright-powered scraper for Arabic car-parts sites."""
 
-    def __init__(self, config: Dict[str, Any]) -> None:
-        super().__init__(config)
+    def __init__(self, config: Dict[str, Any], metrics=None) -> None:
+        super().__init__(config, metrics)
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
+        self._browserless_ws: str = os.environ.get("PLAYWRIGHT_WS", "")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -51,20 +82,30 @@ class AlKhaleegScraper(BaseScraper):
 
     async def setup(self) -> None:
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+
+        if self._browserless_ws:
+            logger.info(
+                "Connecting to Browserless pool at %s", self._browserless_ws
+            )
+            self._browser = await self._playwright.chromium.connect(
+                self._browserless_ws
+            )
+        else:
+            logger.info("Launching local Chromium browser")
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+
         self._context = await self._browser.new_context(
             user_agent=get_headers()["User-Agent"],
             locale="ar-EG",
             extra_http_headers={"Accept-Language": "ar,en-US;q=0.9"},
         )
-        # Mask automation fingerprint
         await self._context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
-        logger.info("AlKhaleeg Playwright browser launched")
+        logger.info("AlKhaleeg browser context ready")
 
     async def teardown(self) -> None:
         if self._context:
@@ -76,7 +117,7 @@ class AlKhaleegScraper(BaseScraper):
         logger.info("AlKhaleeg browser closed")
 
     # ------------------------------------------------------------------
-    # Internal page factory
+    # Internal page helpers
     # ------------------------------------------------------------------
 
     async def _new_page(self) -> Page:
@@ -85,19 +126,49 @@ class AlKhaleegScraper(BaseScraper):
         page.set_default_timeout(LOAD_TIMEOUT)
         return page
 
-    async def _goto(self, page: Page, url: str) -> bool:
-        """Navigate and wait for network idle. Returns False on failure."""
+    async def _goto(self, page: Page, url: str) -> Tuple[bool, str]:
+        """
+        Navigate to *url* and wait for network idle.
+        Returns (success, page_content).
+        On blocking detection, logs a warning and returns (False, "").
+        """
         for attempt in range(1, self.max_retries + 1):
             try:
                 await page.goto(url, wait_until="networkidle")
-                return True
+                content = await page.content()
+
+                if _is_page_blocked(content):
+                    logger.warning(
+                        "Blocking pattern detected on %s (attempt %d)", url, attempt
+                    )
+                    if self._metrics:
+                        self._metrics.record_request(
+                            url=url, success=False, duration=0,
+                            status=403, proxy=None, attempt=attempt, blocked=True,
+                        )
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                if self._metrics:
+                    self._metrics.record_request(
+                        url=url, success=True, duration=0,
+                        status=200, proxy=None, attempt=attempt,
+                    )
+                return True, content
+
             except PlaywrightTimeout:
                 logger.warning("Timeout on %s (attempt %d)", url, attempt)
+                if self._metrics:
+                    self._metrics.record_request(
+                        url=url, success=False, duration=0,
+                        status=408, proxy=None, attempt=attempt,
+                    )
                 await asyncio.sleep(2 ** attempt)
             except Exception as exc:
                 logger.warning("Navigation error %s: %s", url, exc)
                 await asyncio.sleep(2 ** attempt)
-        return False
+
+        return False, ""
 
     # ------------------------------------------------------------------
     # Categories
@@ -107,18 +178,21 @@ class AlKhaleegScraper(BaseScraper):
         """Extract brand/category links from the homepage navigation."""
         page = await self._new_page()
         try:
-            ok = await self._goto(page, self.base_url)
+            ok, html = await self._goto(page, self.base_url)
             if not ok:
+                logger.warning(
+                    "Could not load %s – check base_url in config/sites.yaml",
+                    self.base_url,
+                )
                 return []
 
             selector = self.config.get(
                 "categories_selector", "div.menu-categories a, ul.brands-list a"
             )
-            # Wait until at least one link is visible
             try:
                 await page.wait_for_selector(selector, timeout=LOAD_TIMEOUT)
             except PlaywrightTimeout:
-                logger.warning("Category selector '%s' not found", selector)
+                logger.warning("Category selector '%s' not found on page", selector)
 
             html = await page.content()
         finally:
@@ -145,24 +219,25 @@ class AlKhaleegScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def scrape_products_from_category(
-        self, category_url: str, category_name: Optional[str] = None
+        self,
+        category_url: str,
+        category_name: Optional[str] = None,
+        start_page: int = 1,
     ) -> List[Dict[str, Any]]:
         """Paginate through a category page (handles infinite scroll too)."""
         products: List[Dict[str, Any]] = []
         page = await self._new_page()
         current_url: Optional[str] = category_url
+        page_num = start_page
 
         try:
-            page_num = 1
-            while current_url:
+            while current_url and page_num <= self.max_pages:
                 logger.info("Scraping page %d: %s", page_num, current_url)
-                ok = await self._goto(page, current_url)
+                ok, _ = await self._goto(page, current_url)
                 if not ok:
                     break
 
-                # Scroll to bottom to trigger lazy-loaded images / infinite scroll
                 await self._scroll_to_bottom(page)
-
                 html = await page.content()
                 soup = BeautifulSoup(html, "lxml")
 
@@ -179,7 +254,6 @@ class AlKhaleegScraper(BaseScraper):
                     if product:
                         products.append(product)
 
-                # Next page
                 next_sel = self.config.get("next_page", "a.next-page")
                 next_tag = soup.select_one(next_sel)
                 if next_tag and next_tag.get("href"):
@@ -198,9 +272,9 @@ class AlKhaleegScraper(BaseScraper):
         return products
 
     async def _scroll_to_bottom(self, page: Page) -> None:
-        """Scroll incrementally to trigger lazy loading."""
+        """Scroll incrementally to trigger lazy loading / infinite scroll."""
         prev_height = 0
-        for _ in range(10):  # max 10 scroll steps
+        for _ in range(10):
             height = await page.evaluate("document.body.scrollHeight")
             if height == prev_height:
                 break
@@ -246,7 +320,6 @@ class AlKhaleegScraper(BaseScraper):
             if image_url.startswith("//"):
                 image_url = "https:" + image_url
 
-        # Stock status – common Arabic/English indicators
         stock_text = item.get_text().lower()
         if any(w in stock_text for w in ("out of stock", "نفد", "غير متاح")):
             stock_status = "out_of_stock"
@@ -276,7 +349,7 @@ class AlKhaleegScraper(BaseScraper):
         """Scrape a full product detail page using Playwright."""
         page = await self._new_page()
         try:
-            ok = await self._goto(page, product_url)
+            ok, _ = await self._goto(page, product_url)
             if not ok:
                 return {"url": product_url, "error": "fetch_failed"}
             await self._scroll_to_bottom(page)
@@ -301,9 +374,12 @@ class AlKhaleegScraper(BaseScraper):
         sku = sku_tag.get_text(strip=True) if sku_tag else ""
 
         desc_tag = soup.select_one(".product-description, #product-desc, .description")
-        description = normalise_arabic(desc_tag.get_text(separator=" ", strip=True)) if desc_tag else ""
+        description = (
+            normalise_arabic(desc_tag.get_text(separator=" ", strip=True))
+            if desc_tag
+            else ""
+        )
 
-        # Specification table
         specs: Dict[str, str] = {}
         for row in soup.select("table.specs tr, .product-specs tr, .spec-table tr"):
             cells = row.select("td, th")
@@ -313,7 +389,9 @@ class AlKhaleegScraper(BaseScraper):
                 if key:
                     specs[key] = val
 
-        img_tag = soup.select_one(".product-image img, .main-image img, img.product-img")
+        img_tag = soup.select_one(
+            ".product-image img, .main-image img, img.product-img"
+        )
         image_url = ""
         if img_tag:
             image_url = img_tag.get("src") or img_tag.get("data-src") or ""
