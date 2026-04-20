@@ -217,3 +217,5 @@ scraper_state.db
 
 # Playwright browser binaries
 playwright/.local-browsers/
+
+refrences
