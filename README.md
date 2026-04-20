@@ -1,20 +1,31 @@
-# Scrapyard
+# Scrapyard v3
 
-A high-performance, asynchronous web scraper for automotive parts catalogs across Egyptian and international vendors.
+**Production-grade, async car-parts web scraper for Egyptian and international automotive sites.**
 
 ---
 
 ## Features
 
-- **Async-first** — built on `aiohttp` + `asyncio` for maximum throughput
-- **Playwright support** — handles JavaScript-rendered and Arabic content automatically
-- **Shopify JSON extraction** — pulls embedded product JSON for 100% data accuracy on Shopify stores
-- **Bilingual** — handles both English and Arabic text (including Arabic-Indic digits)
-- **Proxy & User-Agent rotation** — pluggable proxy pool, realistic browser headers
-- **Multiple export formats** — CSV, JSON, Excel, SQLite
-- **Respectful scraping** — configurable delays, exponential backoff on failures
-- **Progress bars** — real-time feedback via `tqdm`
-- **Structured logging** — console + file handler at configurable verbosity
+| Feature | Details |
+|---------|---------|
+| **Async-first** | `aiohttp` + `asyncio` for maximum throughput |
+| **Playwright support** | JavaScript-rendered & Arabic/RTL sites via Chromium |
+| **Browserless pool** | Connect to a remote Browserless instance via `PLAYWRIGHT_WS` |
+| **Shopify JSON extraction** | Pulls embedded product JSON for 100% data accuracy |
+| **Bilingual** | English + Arabic text, including Arabic-Indic digits |
+| **Brotli support** | `auto_decompress=True` + `brotli` package; gzip fallback on error |
+| **Blocking detection** | Content-based CAPTCHA/block pattern scanning with `BlockedError` |
+| **Proxy & UA rotation** | Pluggable proxy pool, 12+ modern browser User-Agents |
+| **Jina AI fallback** | Fetches via [r.jina.ai](https://r.jina.ai) when all HTTP retries fail |
+| **LLM extraction** | `--llm` flag enables GPT-4o-mini structured extraction as a last resort |
+| **Checkpointing** | SQLite-backed resume: skip already-scraped categories/products |
+| **QA validation** | Products failing schema checks saved to `_invalid.csv` |
+| **Multi-format export** | CSV, JSON, Excel, SQLite, PostgreSQL, MySQL |
+| **Slack notifications** | Run start, completion, errors, high failure-rate alerts |
+| **Metrics audit trail** | Per-request log saved to `output/run_<site>_<ts>_meta.json` |
+| **Respectful scraping** | Configurable delays, exponential backoff, `max_pages` cap |
+| **Docker ready** | Multi-stage Dockerfile + Compose with Browserless & Postgres |
+| **Concurrency control** | `--concurrency N` limits parallel scrapes via `asyncio.Semaphore` |
 
 ---
 
@@ -23,60 +34,86 @@ A high-performance, asynchronous web scraper for automotive parts catalogs acros
 | Key | Site | Type |
 |-----|------|------|
 | `egycarparts` | egycarparts.com | Shopify (aiohttp) |
-| `alkhaleeg` | example-alkhaleeg.com | Custom / WooCommerce (Playwright) |
+| `alkhaleeg` | elkhaberstores.com | Arabic / Custom (Playwright) |
+
+Additional sites are configured via `config/sites.yaml` — no code changes needed.
 
 ---
 
 ## Installation
 
-### Prerequisites
+### Requirements
 
 - Python 3.10+
 - pip
 
-### Steps
-
 ```bash
-# 1. Clone the repository
+# 1. Clone
 git clone https://github.com/MohamedBoghdaddy/scrapyard.git
 cd scrapyard
 
-# 2. Create and activate a virtual environment
+# 2. Virtual environment
 python -m venv .venv
 # Windows
 .venv\Scripts\activate
 # macOS / Linux
 source .venv/bin/activate
 
-# 3. Install Python dependencies
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Install Playwright browsers (only needed for Playwright-based scrapers)
+# 4. Install Playwright browser (for Playwright-based scrapers)
 playwright install chromium
+
+# 5. Configure environment
+cp .env.example .env
+# Edit .env and fill in API keys / tokens you want to use
 ```
 
 ---
 
 ## Usage
 
-### Basic – JSON output (default)
+### Basic
 
 ```bash
 python main.py --site egycarparts
-```
-
-### Choose output format
-
-```bash
 python main.py --site egycarparts --format csv
 python main.py --site egycarparts --format excel
 python main.py --site egycarparts --format sqlite
 ```
 
-### Also scrape full product detail pages
+### Resume an interrupted scrape
+
+```bash
+python main.py --site egycarparts --resume
+```
+
+### Scrape detail pages (richer data)
 
 ```bash
 python main.py --site egycarparts --details --format json
+```
+
+### Parallel scraping with concurrency control
+
+```bash
+python main.py --site egycarparts --concurrency 3
+```
+
+### Enable LLM extraction fallback
+
+```bash
+# Requires OPENAI_API_KEY in .env
+python main.py --site egycarparts --llm
+```
+
+### Export to database
+
+```bash
+# Requires DATABASE_URL in .env
+python main.py --site egycarparts --format postgres
+python main.py --site egycarparts --format mysql
 ```
 
 ### Arabic site with Playwright
@@ -85,74 +122,98 @@ python main.py --site egycarparts --details --format json
 python main.py --site alkhaleeg --format excel
 ```
 
-### Custom output directory and log level
-
-```bash
-python main.py --site egycarparts --output data/run1 --log-level DEBUG
-```
-
 ### Full options
 
 ```
 usage: scrapyard [-h] --site {egycarparts,alkhaleeg}
                  [--config CONFIG] [--output OUTPUT]
-                 [--format {csv,json,excel,sqlite}]
-                 [--details] [--log-level {DEBUG,INFO,WARNING,ERROR}]
+                 [--format {csv,json,excel,sqlite,postgres,mysql}]
+                 [--resume] [--concurrency N] [--details]
+                 [--llm] [--max-pages N] [--ignore-ssl]
+                 [--log-level {DEBUG,INFO,WARNING,ERROR}]
 
 options:
   --site          Target site identifier (required)
-  --config        Path to YAML config (default: config/sites.yaml)
-  --output        Output directory    (default: output)
-  --format        Export format       (default: json)
-  --details       Scrape product detail pages too
-  --log-level     Logging verbosity   (default: INFO)
+  --config        Path to YAML config        (default: config/sites.yaml)
+  --output        Output directory           (default: output)
+  --format        Export format              (default: json)
+  --resume        Skip already-scraped URLs
+  --concurrency   Max concurrent fetches     (default: 5)
+  --details       Scrape full product detail pages
+  --llm           Enable GPT-4o-mini extraction fallback
+  --max-pages     Override config max_pages  (default: use config value)
+  --ignore-ssl    Disable SSL verification
+  --log-level     Logging verbosity          (default: INFO)
 ```
 
 ---
 
 ## Configuration
 
-Site-specific selectors live in `config/sites.yaml`:
+Add new sites by adding a YAML block to `config/sites.yaml`:
 
 ```yaml
-egycarparts:
-  base_url: "https://egycarparts.com"
-  type: "shopify"
-  categories_selector: "nav ul li a"
-  product_container: "ul.product-grid li, div.product-item, div.product-card"
+mysite:
+  base_url: "https://example.com"
+  type: "custom"              # or "shopify"
+  categories_selector: "nav a"
+  product_container: "div.product"
   product_link: "a"
-  product_title: ".product-title, h3"
-  price_selector: ".price, .product-price"
-  vendor_selector: ".vendor, .brand"
-  next_page: "a.pagination__next"
+  product_title: "h2"
+  price_selector: ".price"
+  vendor_selector: ".brand"
+  next_page: "a.next"
   use_javascript: false
   request_delay_min: 1.0
   request_delay_max: 3.0
   max_retries: 3
   timeout: 30
+  max_pages: 10
 ```
 
-To add a new site, add a new YAML block and create a corresponding scraper class
-that inherits from `scrapers.base.BaseScraper`.
+Then implement a scraper class inheriting from `scrapers.base.BaseScraper` and register it in `scrapers/__init__.py`.
 
 ---
 
-## Proxy Configuration
-
-Set the `PROXY_LIST` environment variable with a comma-separated list of proxies:
+## Docker Deployment
 
 ```bash
-export PROXY_LIST="http://user:pass@host1:3128,http://user:pass@host2:3128"
-python main.py --site egycarparts
+# From project root
+cp .env.example .env  # fill in tokens
+
+# Build and start all services (Scrapyard + Browserless + Postgres)
+docker compose -f docker/docker-compose.yml up --build
+
+# Run a specific site
+docker compose -f docker/docker-compose.yml run scrapyard \
+    --site egycarparts --format postgres
 ```
 
-When `PROXY_LIST` is empty, the scraper runs without a proxy.
+**Services:**
+
+| Service | Purpose |
+|---------|---------|
+| `scrapyard` | Scraper application |
+| `browserless` | Remote Chromium pool (connects via `PLAYWRIGHT_WS`) |
+| `postgres` | Optional database for `--format postgres` |
+
+---
+
+## Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `JINA_API_KEY` | Jina AI HTTP fallback (after all retries fail) |
+| `OPENAI_API_KEY` | GPT-4o-mini LLM extraction (`--llm` flag) |
+| `SLACK_WEBHOOK_URL` | Slack notifications for run events |
+| `BROWSERLESS_TOKEN` | Auth token for Browserless service |
+| `PLAYWRIGHT_WS` | WebSocket URL of Browserless instance |
+| `DATABASE_URL` | PostgreSQL or MySQL connection string |
+| `PROXY_LIST` | Comma-separated proxy URLs |
 
 ---
 
 ## Output Schema
-
-Each product record contains:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -168,9 +229,9 @@ Each product record contains:
 | `source` | str | Scraper identifier |
 | `description`* | str | Full product description |
 | `specifications`* | dict | Key-value spec table |
-| `variants`* | list | Size/colour variants |
+| `variants`* | list | Size/variant options |
 
-\* Only present when `--details` flag is used.
+\* Only present with `--details`.
 
 ---
 
@@ -180,34 +241,44 @@ Each product record contains:
 scrapyard/
 ├── config/
 │   └── sites.yaml          # Site-specific CSS selectors & settings
+├── db/
+│   ├── checkpoint.py       # SQLite/Postgres resume-state manager
+│   └── models.py           # SQL DDL for all backends
+├── docker/
+│   ├── Dockerfile          # Multi-stage Python 3.11 image
+│   └── docker-compose.yml  # Scrapyard + Browserless + Postgres
+├── notifiers/
+│   └── slack.py            # Slack webhook notifier
 ├── scrapers/
-│   ├── __init__.py
 │   ├── base.py             # Abstract base class
 │   ├── egycarparts.py      # Shopify / aiohttp scraper
 │   ├── alkhaleeg.py        # Arabic / Playwright scraper
 │   └── utils.py            # Shared scraping helpers
 ├── utils/
-│   ├── __init__.py
-│   ├── cleaners.py         # Text / price / URL cleaning
+│   ├── cleaners.py         # Text / price / URL cleaning + first_match()
+│   ├── jina.py             # Jina AI HTTP fallback
+│   ├── llm_extractor.py    # GPT-4o-mini structured extraction
+│   ├── metrics.py          # Per-request audit trail + summary
 │   ├── proxies.py          # Proxy pool manager
-│   ├── storage.py          # Multi-format export
+│   ├── storage.py          # Multi-format export + QA validation
 │   └── user_agents.py      # UA rotation pool
-├── logs/                   # Runtime log files
-├── output/                 # Scraped data (gitignored)
+├── logs/
+├── output/
+├── .env.example
 ├── main.py                 # CLI entry point
-├── requirements.txt
-└── README.md
+└── requirements.txt
 ```
 
 ---
 
 ## Legal Disclaimer
 
-This tool is provided for **educational and research purposes only**.
+This tool is for **educational and authorised research purposes only**.
 
 - Always check a site's `robots.txt` before scraping.
-- Respect `Crawl-delay` directives and rate-limit settings.
-- Do not scrape personal data or content protected by copyright without permission.
+- Respect `Crawl-delay` and rate-limit directives.
+- Obtain permission from site owners before scraping at scale.
+- Do not scrape personal data or copyrighted content without authorisation.
 - The authors accept no liability for misuse of this software.
 
 ---
