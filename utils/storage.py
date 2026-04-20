@@ -3,6 +3,8 @@ DataStorage: export scraped data to CSV, JSON, Excel, SQLite, PostgreSQL, or MyS
 
 Sync formats (csv/json/excel/sqlite) use pandas.
 Async DB formats (postgres/mysql) use asyncpg / aiomysql.
+
+Includes QA validation: invalid products are logged and saved to _invalid.csv.
 """
 from __future__ import annotations
 
@@ -10,7 +12,7 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
@@ -25,15 +27,75 @@ logger = logging.getLogger(__name__)
 
 SyncFormat = Literal["csv", "json", "excel", "sqlite"]
 
-# Product columns that hold structured data (serialised to JSON for flat formats)
 _JSON_COLS = {"specifications", "variants", "tags"}
 
-# Canonical column order for DB inserts
 _PRODUCT_COLS = [
     "url", "name", "price", "raw_price", "vendor", "part_number",
     "image_url", "stock_status", "category", "source",
     "description", "specifications", "variants",
 ]
+
+# ---------------------------------------------------------------------------
+# QA Validation
+# ---------------------------------------------------------------------------
+
+PRODUCT_QA: Dict[str, Dict[str, Any]] = {
+    "name":  {"required": True,  "min_length": 2},
+    "price": {"required": False, "type": float},
+    "url":   {"required": True,  "min_length": 10},
+}
+
+
+def validate_product(product: Dict[str, Any]) -> List[str]:
+    """
+    Run QA rules against a product dict.
+    Returns a list of error messages (empty list = valid).
+    """
+    errors: List[str] = []
+    for field, rules in PRODUCT_QA.items():
+        value = product.get(field)
+        if rules.get("required") and not value:
+            errors.append(f"Missing required field: {field!r}")
+            continue
+        if value is None:
+            continue
+        min_len = rules.get("min_length")
+        if min_len and isinstance(value, str) and len(value) < min_len:
+            errors.append(
+                f"Field {field!r} too short: {len(value)} < {min_len}"
+            )
+        expected_type = rules.get("type")
+        if expected_type and not isinstance(value, expected_type):
+            try:
+                expected_type(value)
+            except (TypeError, ValueError):
+                errors.append(
+                    f"Field {field!r} is not {expected_type.__name__}: {value!r}"
+                )
+    return errors
+
+
+def partition_products(
+    data: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Split *data* into (valid, invalid) based on PRODUCT_QA rules.
+    Invalid products have an extra '_validation_errors' key.
+    """
+    valid, invalid = [], []
+    for product in data:
+        errs = validate_product(product)
+        if errs:
+            invalid.append({**product, "_validation_errors": errs})
+            logger.warning("Invalid product %s: %s", product.get("url", "?"), errs)
+        else:
+            valid.append(product)
+    return valid, invalid
+
+
+# ---------------------------------------------------------------------------
+# Main storage class
+# ---------------------------------------------------------------------------
 
 
 class DataStorage:
@@ -62,6 +124,9 @@ class DataStorage:
     ) -> Path:
         """
         Write *data* to *filepath* in the chosen format.
+
+        Valid products are written to the main file.
+        Invalid products (failing QA) are written to a sibling _invalid.csv file.
         Returns the resolved output Path.
         """
         path = Path(filepath)
@@ -71,10 +136,27 @@ class DataStorage:
             logger.warning("save() called with empty data – skipping write")
             return path
 
+        valid, invalid = partition_products(data)
+        logger.info(
+            "QA results: %d valid, %d invalid out of %d total",
+            len(valid), len(invalid), len(data),
+        )
+
+        if invalid:
+            inv_path = path.parent / f"{path.name}_invalid"
+            DataStorage._save_csv(invalid, inv_path)
+            logger.warning(
+                "%d invalid products written to %s", len(invalid), inv_path.with_suffix(".csv")
+            )
+
+        if not valid:
+            logger.warning("No valid products to save")
+            return path
+
         dispatch = {
-            "csv": DataStorage._save_csv,
-            "json": DataStorage._save_json,
-            "excel": DataStorage._save_excel,
+            "csv":    DataStorage._save_csv,
+            "json":   DataStorage._save_json,
+            "excel":  DataStorage._save_excel,
             "sqlite": DataStorage._save_sqlite,
         }
         handler = dispatch.get(fmt)
@@ -83,8 +165,8 @@ class DataStorage:
                 f"Unsupported format '{fmt}'. Choose from: {list(dispatch)}"
             )
 
-        handler(data, path)
-        logger.info("Saved %d records → %s (%s)", len(data), path, fmt)
+        handler(valid, path)
+        logger.info("Saved %d records → %s (%s)", len(valid), path, fmt)
         return path
 
     @staticmethod
@@ -137,11 +219,7 @@ class DataStorage:
         db_url: str,
         table: str = "products",
     ) -> int:
-        """
-        Bulk-insert *data* into a PostgreSQL table using asyncpg.
-        Creates the table automatically if it does not exist.
-        Returns the number of rows inserted.
-        """
+        """Bulk-insert *data* into PostgreSQL. Returns rows inserted."""
         try:
             import asyncpg
         except ImportError as exc:
@@ -172,7 +250,7 @@ class DataStorage:
                                     scraped_at   = NOW()
                             """,
                             row["url"],
-                            row["name"],
+                            row.get("name"),
                             row.get("price"),
                             row.get("raw_price", ""),
                             row.get("vendor", ""),
@@ -182,15 +260,13 @@ class DataStorage:
                             row.get("category", ""),
                             row.get("source", ""),
                             row.get("description", ""),
-                            row.get("specifications"),   # JSONB
-                            row.get("variants"),         # JSONB
+                            row.get("specifications"),
+                            row.get("variants"),
                         )
                         inserted += 1
                     except Exception as exc:
-                        logger.warning(
-                            "Skipped row (url=%s): %s", row.get("url"), exc
-                        )
-            logger.info("PostgreSQL: inserted/upserted %d rows into '%s'", inserted, table)
+                        logger.warning("Skipped row (url=%s): %s", row.get("url"), exc)
+            logger.info("PostgreSQL: upserted %d rows into '%s'", inserted, table)
             return inserted
         finally:
             await conn.close()
@@ -201,11 +277,7 @@ class DataStorage:
         db_url: str,
         table: str = "products",
     ) -> int:
-        """
-        Bulk-insert *data* into a MySQL table using aiomysql.
-        Creates the table automatically if it does not exist.
-        Returns the number of rows inserted.
-        """
+        """Bulk-insert *data* into MySQL. Returns rows inserted."""
         try:
             import aiomysql
         except ImportError as exc:
@@ -286,14 +358,5 @@ class DataStorage:
 
     @staticmethod
     def _to_db_rows(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Prepare rows for DB insertion:
-         – ensure 'url' exists (skip rows without it)
-         – keep dict/list values as-is for asyncpg (JSONB) but serialise for MySQL
-        """
-        out = []
-        for row in data:
-            if not row.get("url"):
-                continue
-            out.append(row)
-        return out
+        """Filter out rows without a URL (required for DB unique key)."""
+        return [row for row in data if row.get("url")]
