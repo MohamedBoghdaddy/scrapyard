@@ -4,16 +4,21 @@ Scraper for EgyCarParts (Shopify-based store).
 Strategy:
   1. Parse category links from the main navigation.
   2. For each category, paginate through product listing pages.
-     - Supports start_page for checkpoint resume.
-  3. For product detail pages, attempt to extract the embedded Shopify JSON
-     (`var meta = {...}`) first; fall back to HTML parsing if absent.
+     Supports start_page for checkpoint resume.
+  3. For product detail pages, extract embedded Shopify JSON first;
+     fall back to HTML parsing, then LLM extraction if --llm is enabled.
+  4. Jina AI is used as a last resort if all HTTP retries are exhausted.
+
+Brotli fix: ClientSession is created with auto_decompress=True.
+Blocking detection: response body is scanned for bot-detection patterns.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
 
 import aiohttp
@@ -27,16 +32,53 @@ from .utils import (
     get_headers,
     random_delay,
 )
+from utils.cleaners import first_match
+from utils.jina import fetch_via_jina
 from utils.proxies import ProxyManager
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Blocking detection
+# ---------------------------------------------------------------------------
+
+_BLOCK_PATTERNS = [
+    (re.compile(r"captcha|robot|challenge", re.I), 403),
+    (re.compile(r"access denied|forbidden", re.I), 403),
+    (re.compile(r"rate limit|too many requests", re.I), 429),
+    (re.compile(r"please verify you are a human", re.I), 403),
+]
+
+
+class BlockedError(Exception):
+    """Raised when a response body matches a bot-detection pattern."""
+
+    def __init__(self, url: str, status: int) -> None:
+        super().__init__(f"Blocked ({status}) at {url}")
+        self.url = url
+        self.status = status
+
+
+def _check_content_blocking(body: str) -> Tuple[bool, int]:
+    """Return (is_blocked, inferred_status) by scanning the response body."""
+    sample = body[:2000]
+    for pattern, status in _BLOCK_PATTERNS:
+        if pattern.search(sample):
+            return True, status
+    return False, 0
+
+
+# ---------------------------------------------------------------------------
+# Scraper
+# ---------------------------------------------------------------------------
+
+
 class EgyCarPartsScraper(BaseScraper):
     """Async scraper for egycarparts.com (Shopify)."""
 
-    def __init__(self, config: Dict[str, Any]) -> None:
-        super().__init__(config)
+    def __init__(self, config: Dict[str, Any], metrics=None) -> None:
+        super().__init__(config, metrics)
         self._session: Optional[aiohttp.ClientSession] = None
         self._proxy_manager = ProxyManager()
 
@@ -47,12 +89,14 @@ class EgyCarPartsScraper(BaseScraper):
     async def setup(self) -> None:
         connector = aiohttp.TCPConnector(ssl=False, limit=10)
         timeout = aiohttp.ClientTimeout(total=self.timeout)
+        # auto_decompress=True handles Brotli (br) encoding transparently
         self._session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
             headers=get_headers(),
+            auto_decompress=True,
         )
-        logger.info("EgyCarParts session initialised")
+        logger.info("EgyCarParts session initialised (auto_decompress=True)")
 
     async def teardown(self) -> None:
         if self._session and not self._session.closed:
@@ -60,37 +104,105 @@ class EgyCarPartsScraper(BaseScraper):
         logger.info("EgyCarParts session closed")
 
     # ------------------------------------------------------------------
-    # Internal fetch with retry + exponential backoff
+    # Internal fetch with retry, blocking detection, and Jina fallback
     # ------------------------------------------------------------------
 
     async def _fetch(
         self, url: str, *, as_json: bool = False
-    ) -> tuple[Optional[Any], float]:
+    ) -> Tuple[Optional[Any], float]:
         """
         GET *url* with up to self.max_retries attempts.
-        Returns (decoded_body, duration_seconds).
-        Body is None on failure.
+
+        Attempt order:
+          1. aiohttp with auto_decompress=True (handles Brotli).
+          2. On Brotli/decode error, retry with Accept-Encoding: gzip, deflate.
+          3. On BlockedError, rotate proxy and retry.
+          4. After all retries, fall back to Jina AI if JINA_API_KEY is set.
+
+        Returns (decoded_body, duration_seconds). Body is None on total failure.
         """
         proxy = self._proxy_manager.get_proxy()
         t0 = time.monotonic()
+
         for attempt in range(1, self.max_retries + 1):
+            headers = get_headers()
             try:
                 async with self._session.get(
                     url,
-                    headers=get_headers(),
+                    headers=headers,
                     proxy=proxy,
                     allow_redirects=True,
                 ) as resp:
+                    duration = time.monotonic() - t0
                     if resp.status == 429:
                         wait = 2 ** attempt * 5
-                        logger.warning(
-                            "Rate-limited on %s – sleeping %ds", url, wait
-                        )
+                        logger.warning("Rate-limited on %s – sleeping %ds", url, wait)
+                        if self._metrics:
+                            self._metrics.record_request(
+                                url=url, success=False, duration=duration,
+                                status=429, proxy=proxy, attempt=attempt,
+                            )
                         await asyncio.sleep(wait)
                         continue
+
                     resp.raise_for_status()
-                    body = await resp.json(content_type=None) if as_json else await resp.text()
-                    return body, time.monotonic() - t0
+                    body = (
+                        await resp.json(content_type=None)
+                        if as_json
+                        else await resp.text()
+                    )
+
+                    if not as_json:
+                        blocked, block_status = _check_content_blocking(body)
+                        if blocked:
+                            logger.warning("Blocking pattern detected on %s", url)
+                            if self._metrics:
+                                self._metrics.record_request(
+                                    url=url, success=False, duration=duration,
+                                    status=block_status, proxy=proxy,
+                                    attempt=attempt, blocked=True,
+                                )
+                            raise BlockedError(url, block_status)
+
+                    if self._metrics:
+                        self._metrics.record_request(
+                            url=url, success=True, duration=duration,
+                            status=resp.status, proxy=proxy, attempt=attempt,
+                        )
+                    return body, duration
+
+            except BlockedError:
+                if proxy:
+                    self._proxy_manager.mark_bad(proxy)
+                proxy = self._proxy_manager.get_proxy()
+                await asyncio.sleep(2 ** attempt)
+
+            except (UnicodeDecodeError, aiohttp.ContentTypeError):
+                # Brotli decode failure fallback: retry with conservative encoding
+                logger.warning(
+                    "Decode error on %s (attempt %d) – retrying with gzip/deflate only",
+                    url, attempt,
+                )
+                headers = {
+                    **headers,
+                    "Accept-Encoding": "gzip, deflate",
+                }
+                try:
+                    async with self._session.get(
+                        url, headers=headers, proxy=proxy, allow_redirects=True
+                    ) as resp2:
+                        body = await resp2.text(errors="replace")
+                        duration = time.monotonic() - t0
+                        if self._metrics:
+                            self._metrics.record_request(
+                                url=url, success=True, duration=duration,
+                                status=resp2.status, proxy=proxy, attempt=attempt,
+                            )
+                        return body, duration
+                except Exception:
+                    pass
+                await asyncio.sleep(2 ** attempt)
+
             except aiohttp.ClientError as exc:
                 backoff = 2 ** attempt
                 logger.warning(
@@ -101,12 +213,27 @@ class EgyCarPartsScraper(BaseScraper):
                     self._proxy_manager.mark_bad(proxy)
                     proxy = self._proxy_manager.get_proxy()
                 await asyncio.sleep(backoff)
+
             except asyncio.TimeoutError:
                 logger.warning("Timeout on %s (attempt %d)", url, attempt)
                 await asyncio.sleep(2 ** attempt)
 
+        duration = time.monotonic() - t0
         logger.error("All retries exhausted for %s", url)
-        return None, time.monotonic() - t0
+
+        # Jina AI fallback
+        jina_content = await fetch_via_jina(url)
+        if jina_content:
+            if self._metrics:
+                self._metrics.record_jina_fallback()
+            return jina_content, time.monotonic() - t0
+
+        if self._metrics:
+            self._metrics.record_request(
+                url=url, success=False, duration=duration,
+                status=0, proxy=proxy, attempt=self.max_retries,
+            )
+        return None, duration
 
     # ------------------------------------------------------------------
     # Categories
@@ -137,7 +264,7 @@ class EgyCarPartsScraper(BaseScraper):
                 continue
             seen.add(url)
             categories.append({"name": name, "url": url})
-            logger.debug("Category found: %s -> %s", name, url)
+            logger.debug("Category: %s -> %s", name, url)
 
         logger.info("Found %d categories", len(categories))
         return categories
@@ -152,19 +279,14 @@ class EgyCarPartsScraper(BaseScraper):
         category_name: Optional[str] = None,
         start_page: int = 1,
     ) -> List[Dict[str, Any]]:
-        """
-        Paginate through a category and return all product stubs.
-        *start_page* allows resuming from a checkpoint.
-        """
+        """Paginate through a category and return all product stubs."""
         products: List[Dict[str, Any]] = []
         page_num = start_page
-
-        # Build the URL for the first page to fetch
         page_url: Optional[str] = self._page_url(category_url, page_num)
 
-        while page_url:
+        while page_url and page_num <= self.max_pages:
             logger.info("Scraping page %d: %s", page_num, page_url)
-            html, _duration = await self._fetch(page_url)
+            html, _ = await self._fetch(page_url)
             if not html:
                 break
 
@@ -194,8 +316,7 @@ class EgyCarPartsScraper(BaseScraper):
 
         logger.info(
             "Category '%s' yielded %d products",
-            category_name or category_url,
-            len(products),
+            category_name or category_url, len(products),
         )
         return products
 
@@ -203,7 +324,6 @@ class EgyCarPartsScraper(BaseScraper):
         """Construct a Shopify paginated URL (e.g. ?page=3)."""
         if page <= 1:
             return base
-        # Preserve existing query params
         parts = list(urlparse(base))
         params = parse_qs(parts[4])
         params["page"] = [str(page)]
@@ -213,32 +333,37 @@ class EgyCarPartsScraper(BaseScraper):
     def _extract_listing_product(
         self, item: Any, category_name: Optional[str]
     ) -> Optional[Dict[str, Any]]:
-        """Extract lightweight product data from a listing card element."""
-        link_sel = self.config.get("product_link", "a")
+        """Extract lightweight product data from a listing card using first_match."""
         title_sel = self.config.get("product_title", ".product-title, h3")
         price_sel = self.config.get("price_selector", ".price")
         vendor_sel = self.config.get("vendor_selector", ".vendor")
+        link_sel = self.config.get("product_link", "a")
 
         link_tag = item.select_one(link_sel)
         if not link_tag:
             return None
 
         url = self._absolute_url(link_tag.get("href", ""))
-        title_tag = item.select_one(title_sel)
-        name = (
-            title_tag.get_text(strip=True)
-            if title_tag
-            else link_tag.get_text(strip=True)
-        )
 
-        price_tag = item.select_one(price_sel)
-        raw_price = price_tag.get_text(strip=True) if price_tag else ""
+        name = first_match(item, [
+            (title_sel, None),
+            ("h3", None),
+            ("h2", None),
+        ]) or link_tag.get_text(strip=True)
 
-        vendor_tag = item.select_one(vendor_sel)
-        vendor = vendor_tag.get_text(strip=True) if vendor_tag else ""
+        raw_price = first_match(item, [
+            (price_sel, None),
+            (".money", None),
+            ("[class*='price']", None),
+        ]) or ""
 
-        img_tag = item.select_one("img")
+        vendor = first_match(item, [
+            (vendor_sel, None),
+            (".brand", None),
+        ]) or ""
+
         image_url = ""
+        img_tag = item.select_one("img")
         if img_tag:
             image_url = img_tag.get("src") or img_tag.get("data-src") or ""
             if image_url.startswith("//"):
@@ -264,9 +389,13 @@ class EgyCarPartsScraper(BaseScraper):
     async def scrape_product_details(self, product_url: str) -> Dict[str, Any]:
         """
         Fetch a product page and return full details.
-        Prioritises Shopify's embedded JSON; falls back to HTML parsing.
+
+        Priority:
+          1. Shopify embedded JSON (most accurate).
+          2. HTML parsing with CSS selector cascade.
+          3. LLM extraction (if --llm is enabled and selectors fail).
         """
-        html, _duration = await self._fetch(product_url)
+        html, _ = await self._fetch(product_url)
         if not html:
             return {"url": product_url, "error": "fetch_failed"}
 
@@ -274,11 +403,28 @@ class EgyCarPartsScraper(BaseScraper):
         if shopify_data:
             return self._parse_shopify_json(shopify_data, product_url)
 
-        return self._parse_product_html(html, product_url)
+        result = self._parse_product_html(html, product_url)
 
-    def _parse_shopify_json(
-        self, data: Dict[str, Any], url: str
-    ) -> Dict[str, Any]:
+        # LLM fallback when CSS selectors yielded no name
+        if not result.get("name") and self.llm_enabled:
+            logger.info("CSS selectors empty – trying LLM extraction for %s", product_url)
+            from utils.llm_extractor import extract_with_llm
+            llm_data = await extract_with_llm(html)
+            if llm_data:
+                if self._metrics:
+                    self._metrics.record_llm_extraction()
+                result.update({
+                    "name": llm_data.get("name", result.get("name", "")),
+                    "vendor": llm_data.get("brand", result.get("vendor", "")),
+                    "part_number": llm_data.get("part_number", result.get("part_number", "")),
+                    "price": llm_data.get("price") or result.get("price"),
+                    "description": llm_data.get("description", result.get("description", "")),
+                    "data_source": "llm_extraction",
+                })
+
+        return result
+
+    def _parse_shopify_json(self, data: Dict[str, Any], url: str) -> Dict[str, Any]:
         """Map Shopify product JSON to the canonical schema."""
         variants = data.get("variants", [])
         first = variants[0] if variants else {}
@@ -324,19 +470,43 @@ class EgyCarPartsScraper(BaseScraper):
         """HTML fallback for product pages without embedded JSON."""
         soup = BeautifulSoup(html, "lxml")
 
-        name = _text(soup, "h1.product-title, h1.product__title, h1")
-        price_tag = soup.select_one(".price__current, .product__price, .price")
-        raw_price = price_tag.get_text(strip=True) if price_tag else ""
-        vendor = _text(soup, ".product__vendor, .vendor")
-        sku = _text(soup, ".product__sku, .sku")
-        description = _text(soup, ".product__description, #product-description")
+        name = first_match(soup, [
+            ("h1.product-title", None),
+            ("h1.product__title", None),
+            ("h1", None),
+            ('meta[property="og:title"]', "content"),
+        ]) or ""
 
-        img = soup.select_one(".product__media img, .product-image img")
-        image_url = ""
-        if img:
-            image_url = img.get("src") or img.get("data-src") or ""
-            if image_url.startswith("//"):
-                image_url = "https:" + image_url
+        raw_price = first_match(soup, [
+            (".price__current", None),
+            (".product__price", None),
+            (".price", None),
+            ('meta[property="og:price:amount"]', "content"),
+        ]) or ""
+
+        vendor = first_match(soup, [
+            (".product__vendor", None),
+            (".vendor", None),
+        ]) or ""
+
+        sku = first_match(soup, [
+            (".product__sku", None),
+            (".sku", None),
+        ]) or ""
+
+        description = first_match(soup, [
+            (".product__description", None),
+            ("#product-description", None),
+            (".description", None),
+        ]) or ""
+
+        image_url = first_match(soup, [
+            (".product__media img", "src"),
+            (".product-image img", "src"),
+            ('meta[property="og:image"]', "content"),
+        ]) or ""
+        if image_url.startswith("//"):
+            image_url = "https:" + image_url
 
         specs: Dict[str, str] = {}
         for row in soup.select("table.product-specs tr, .specifications tr"):
@@ -372,13 +542,8 @@ class EgyCarPartsScraper(BaseScraper):
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers
+# Module helpers
 # ---------------------------------------------------------------------------
-
-def _text(soup: BeautifulSoup, selector: str) -> str:
-    tag = soup.select_one(selector)
-    return tag.get_text(strip=True) if tag else ""
-
 
 def _strip_html(html_str: str) -> str:
     if not html_str:
