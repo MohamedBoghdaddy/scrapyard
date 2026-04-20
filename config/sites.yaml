@@ -1,0 +1,31 @@
+egycarparts:
+  base_url: "https://egycarparts.com"
+  type: "shopify"
+  categories_selector: "nav ul li a"
+  product_container: "ul.product-grid li, div.product-item, div.product-card"
+  product_link: "a"
+  product_title: ".product-title, h3"
+  price_selector: ".price, .product-price"
+  vendor_selector: ".vendor, .brand"
+  next_page: "a.pagination__next"
+  use_javascript: false
+  request_delay_min: 1.0
+  request_delay_max: 3.0
+  max_retries: 3
+  timeout: 30
+
+alkhaleeg:
+  base_url: "https://example-alkhaleeg.com"
+  type: "custom"
+  categories_selector: "div.menu-categories a, ul.brands-list a"
+  product_container: "div.product-item, li.product"
+  product_link: "a.product-img"
+  product_title: "h4.product-name"
+  price_selector: "span.price"
+  vendor_selector: "span.brand-name"
+  next_page: "a.next-page"
+  use_javascript: true
+  request_delay_min: 2.0
+  request_delay_max: 5.0
+  max_retries: 3
+  timeout: 60
