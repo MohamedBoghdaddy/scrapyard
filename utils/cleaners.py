@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
-from typing import Optional
+from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Price cleaning
@@ -28,9 +28,9 @@ def clean_price(price_str: str) -> Optional[float]:
     Parse a raw price string into a float.
 
     Handles:
-      - "LE 750.00 EGP"   -> 750.0
-      - "Sale Price: 1,200" -> 1200.0
-      - "From $19.99"     -> 19.99
+      - "LE 750.00 EGP"     -> 750.0
+      - "Sale Price: 1,200"  -> 1200.0
+      - "From $19.99"        -> 19.99
       - Arabic-Indic digits (٠١٢٣٤٥٦٧٨٩)
     Returns None when parsing fails.
     """
@@ -114,3 +114,36 @@ def to_slug(text: str) -> str:
     text = text.encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^\w\s-]", "", text).strip().lower()
     return re.sub(r"[\s_-]+", "-", text)
+
+
+# ---------------------------------------------------------------------------
+# CSS selector cascade helper
+# ---------------------------------------------------------------------------
+
+
+def first_match(
+    soup,
+    selectors: List[Tuple[str, Optional[str]]],
+) -> Optional[str]:
+    """
+    Try CSS selectors in order; return the first non-empty result.
+
+    Each entry is a (selector, attribute) pair:
+      - If attribute is None, return the element's text content.
+      - If attribute is a string (e.g. "href", "src"), return that attribute.
+
+    Example::
+
+        title = first_match(soup, [
+            (".product-title", None),
+            ("h1.title", None),
+            ('meta[property="og:title"]', "content"),
+        ])
+    """
+    for sel, attr in selectors:
+        el = soup.select_one(sel)
+        if el:
+            result = el.get(attr) if attr else el.get_text(strip=True)
+            if result:
+                return str(result).strip()
+    return None
