@@ -1,3 +1,9 @@
+# Scrapyard – Site configuration
+# --------------------------------
+# Add new sites by copying the block structure below and updating the selectors.
+# Required fields: base_url, type
+# Optional fields: everything else (sensible defaults apply in code)
+
 egycarparts:
   base_url: "https://egycarparts.com"
   type: "shopify"
@@ -13,9 +19,14 @@ egycarparts:
   request_delay_max: 3.0
   max_retries: 3
   timeout: 30
+  max_pages: 10
 
+# Al Khaleeg / Elkhabers Stores – Arabic custom site
+# NOTE: Replace base_url with the actual site URL once you have scraping permission.
+#       If the URL is invalid or the site is unreachable, the scraper will log a
+#       warning and exit gracefully without crashing.
 alkhaleeg:
-  base_url: "https://example-alkhaleeg.com"
+  base_url: "https://elkhaberstores.com"
   type: "custom"
   categories_selector: "div.menu-categories a, ul.brands-list a"
   product_container: "div.product-item, li.product"
@@ -29,3 +40,22 @@ alkhaleeg:
   request_delay_max: 5.0
   max_retries: 3
   timeout: 60
+  max_pages: 5
+
+# ── Template for new sites ────────────────────────────────────────────────────
+# mysite:
+#   base_url: "https://example.com"
+#   type: "custom"          # or "shopify"
+#   categories_selector: "nav a"
+#   product_container: "div.product"
+#   product_link: "a"
+#   product_title: "h2"
+#   price_selector: ".price"
+#   vendor_selector: ".brand"
+#   next_page: "a.next"
+#   use_javascript: false
+#   request_delay_min: 1.0
+#   request_delay_max: 3.0
+#   max_retries: 3
+#   timeout: 30
+#   max_pages: 10
