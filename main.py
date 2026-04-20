@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -56,8 +57,6 @@ def _configure_logging(level: str = "INFO") -> None:
 
 logger = logging.getLogger("scrapyard")
 
-KNOWN_SITES = ["egycarparts", "alkhaleeg"]
-
 # ---------------------------------------------------------------------------
 # Core async logic
 # ---------------------------------------------------------------------------
@@ -81,7 +80,8 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
 
     # ── Scraping ──────────────────────────────────────────────────────────
     all_products: List[Dict[str, Any]] = []
-    scraper_cls = get_scraper(args.site)
+    site_config["site_id"] = args.site
+    scraper_cls = get_scraper(args.site, site_config)
 
     async with scraper_cls(site_config, metrics=metrics) as scraper:
 
@@ -205,9 +205,11 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
             all_products = [r for r in enriched if isinstance(r, dict)]
 
     # ── Save results ──────────────────────────────────────────────────────
+    summary = metrics.finish()
+    run_metadata = _build_run_metadata(args, site_config, summary)
+
     if not all_products:
         logger.warning("No products to save")
-        summary = metrics.finish()
         _write_metrics(args.site, metrics)
         await notifier.notify_complete(args.site, summary)
         if checkpoint:
@@ -233,14 +235,25 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
             saved = await DataStorage.save_mysql(all_products, db_url)
             logger.info("MySQL: %d rows inserted", saved)
         # Also save a local JSON copy for reference
-        DataStorage.save(all_products, output_path, fmt="json")
+        DataStorage.save(
+            all_products,
+            output_path,
+            fmt="json",
+            site_config=site_config,
+            run_metadata=run_metadata,
+        )
     else:
-        saved_path = DataStorage.save(all_products, output_path, fmt=args.format)
+        saved_path = DataStorage.save(
+            all_products,
+            output_path,
+            fmt=args.format,
+            site_config=site_config,
+            run_metadata=run_metadata,
+        )
         logger.info("Results saved to %s", saved_path)
         print(f"\nDone. {len(all_products)} products saved to: {saved_path}")
 
     # ── Metrics + notifications ───────────────────────────────────────────
-    summary = metrics.finish()
     metrics_path = _write_metrics(args.site, metrics)
     logger.info("Run metadata saved to %s", metrics_path)
 
@@ -257,6 +270,35 @@ def _write_metrics(site: str, metrics: MetricsCollector) -> Path:
     path = Path("output") / f"run_{site}_{timestamp}_meta.json"
     metrics.save_summary(path)
     return path
+
+
+def _build_run_metadata(
+    args: argparse.Namespace,
+    site_config: Dict[str, Any],
+    summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    completed_at = datetime.now(timezone.utc)
+    started_at = completed_at - timedelta(
+        seconds=float(summary.get("elapsed_seconds", 0) or 0)
+    )
+    filters = {
+        "site": args.site,
+        "format": args.format,
+        "resume": args.resume,
+        "concurrency": args.concurrency,
+        "details": args.details,
+        "llm": args.llm,
+        "max_pages": args.max_pages or site_config.get("max_pages", 0),
+        "ignore_ssl": args.ignore_ssl,
+    }
+    return {
+        "run_id": f"{args.site}_{completed_at.strftime('%Y%m%dT%H%M%SZ')}",
+        "started_at": started_at.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "total_products": int(summary.get("total_products", 0)),
+        "sites_scraped": args.site,
+        "filters_applied": json.dumps(filters, ensure_ascii=False),
+    }
 
 
 def _print_summary(summary: Dict[str, Any]) -> None:
@@ -289,8 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--site",
         required=True,
-        choices=KNOWN_SITES,
-        help="Target site identifier",
+        help="Target site identifier from config/sites.yaml",
     )
     parser.add_argument(
         "--config",

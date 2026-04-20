@@ -1,33 +1,36 @@
 """
-Scraper for EgyCarParts (Shopify-based store).
+Generic HTTP scraper for automotive catalog sites.
 
-Strategy:
-  1. Parse category links from the main navigation.
-  2. For each category, paginate through product listing pages.
-     Supports start_page for checkpoint resume.
-  3. For product detail pages, extract embedded Shopify JSON first;
-     fall back to HTML parsing, then LLM extraction if --llm is enabled.
-  4. Jina AI is used as a last resort if all HTTP retries are exhausted.
+This scraper now powers non-JavaScript sites across multiple storefront styles:
+  - Shopify-style stores (/collections/, /products/)
+  - WooCommerce/custom stores (/product-category/, /product/)
+  - Custom catalog pages (/shop?category=, /product-detail/)
+  - Inventory-style sites that expose product-like links in plain HTML
 
-Brotli fix: ClientSession is created with auto_decompress=True.
-Blocking detection: response body is scanned for bot-detection patterns.
+It keeps the stronger retry/blocking behavior that was already present for the
+original EgyCarParts implementation, but resolves selectors and link patterns
+from config so one scraper can cover many sites. Product detail parsing is
+hybrid: if a page exposes Shopify JSON, that payload wins even when the site
+config is marked as `type: custom`.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import aiohttp
 from bs4 import BeautifulSoup
 
+from . import detect_storefront_type
 from .base import BaseScraper
 from .utils import (
-    clean_price,
     clean_part_number,
+    clean_price,
     extract_shopify_product_json,
     get_headers,
     random_delay,
@@ -39,15 +42,13 @@ from utils.proxies import ProxyManager
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Blocking detection
-# ---------------------------------------------------------------------------
-
 _BLOCK_PATTERNS = [
-    (re.compile(r"captcha|robot|challenge", re.I), 403),
+    (re.compile(r"captcha", re.I), 403),
     (re.compile(r"access denied|forbidden", re.I), 403),
     (re.compile(r"rate limit|too many requests", re.I), 429),
     (re.compile(r"please verify you are a human", re.I), 403),
+    (re.compile(r"attention required", re.I), 403),
+    (re.compile(r"cf-browser-verification|__cf_chl_|challenge-platform", re.I), 403),
 ]
 
 
@@ -62,64 +63,47 @@ class BlockedError(Exception):
 
 def _check_content_blocking(body: str) -> Tuple[bool, int]:
     """Return (is_blocked, inferred_status) by scanning the response body."""
-    sample = body[:2000]
+    sample = BeautifulSoup(body[:15000], "lxml").get_text(" ", strip=True)[:3000]
     for pattern, status in _BLOCK_PATTERNS:
         if pattern.search(sample):
             return True, status
     return False, 0
 
 
-# ---------------------------------------------------------------------------
-# Scraper
-# ---------------------------------------------------------------------------
-
-
 class EgyCarPartsScraper(BaseScraper):
-    """Async scraper for egycarparts.com (Shopify)."""
+    """Config-driven HTTP scraper for catalog-style sites."""
 
     def __init__(self, config: Dict[str, Any], metrics=None) -> None:
         super().__init__(config, metrics)
         self._session: Optional[aiohttp.ClientSession] = None
         self._proxy_manager = ProxyManager()
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        self.source = self.site_id
 
     async def setup(self) -> None:
-        connector = aiohttp.TCPConnector(ssl=False, limit=10)
+        connector_kwargs: Dict[str, Any] = {"limit": 10}
+        if self.config.get("ignore_ssl"):
+            connector_kwargs["ssl"] = False
+        connector = aiohttp.TCPConnector(**connector_kwargs)
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        # auto_decompress=True handles Brotli (br) encoding transparently
         self._session = aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
             headers=get_headers(),
             auto_decompress=True,
         )
-        logger.info("EgyCarParts session initialised (auto_decompress=True)")
+        logger.info("%s HTTP session initialised", self.source)
 
     async def teardown(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
-        logger.info("EgyCarParts session closed")
-
-    # ------------------------------------------------------------------
-    # Internal fetch with retry, blocking detection, and Jina fallback
-    # ------------------------------------------------------------------
+        logger.info("%s HTTP session closed", self.source)
 
     async def _fetch(
         self, url: str, *, as_json: bool = False
     ) -> Tuple[Optional[Any], float]:
         """
-        GET *url* with up to self.max_retries attempts.
-
-        Attempt order:
-          1. aiohttp with auto_decompress=True (handles Brotli).
-          2. On Brotli/decode error, retry with Accept-Encoding: gzip, deflate.
-          3. On BlockedError, rotate proxy and retry.
-          4. After all retries, fall back to Jina AI if JINA_API_KEY is set.
-
-        Returns (decoded_body, duration_seconds). Body is None on total failure.
+        GET *url* with retries, content blocking detection, and Jina fallback.
+        Returns (body, duration_seconds). Body is None on failure.
         """
         proxy = self._proxy_manager.get_proxy()
         t0 = time.monotonic()
@@ -136,12 +120,15 @@ class EgyCarPartsScraper(BaseScraper):
                     duration = time.monotonic() - t0
                     if resp.status == 429:
                         wait = 2 ** attempt * 5
-                        logger.warning("Rate-limited on %s – sleeping %ds", url, wait)
-                        if self._metrics:
-                            self._metrics.record_request(
-                                url=url, success=False, duration=duration,
-                                status=429, proxy=proxy, attempt=attempt,
-                            )
+                        logger.warning("Rate-limited on %s - sleeping %ds", url, wait)
+                        self._record_request(
+                            url=url,
+                            success=False,
+                            duration=duration,
+                            status=429,
+                            proxy=proxy,
+                            attempt=attempt,
+                        )
                         await asyncio.sleep(wait)
                         continue
 
@@ -156,19 +143,25 @@ class EgyCarPartsScraper(BaseScraper):
                         blocked, block_status = _check_content_blocking(body)
                         if blocked:
                             logger.warning("Blocking pattern detected on %s", url)
-                            if self._metrics:
-                                self._metrics.record_request(
-                                    url=url, success=False, duration=duration,
-                                    status=block_status, proxy=proxy,
-                                    attempt=attempt, blocked=True,
-                                )
+                            self._record_request(
+                                url=url,
+                                success=False,
+                                duration=duration,
+                                status=block_status,
+                                proxy=proxy,
+                                attempt=attempt,
+                                blocked=True,
+                            )
                             raise BlockedError(url, block_status)
 
-                    if self._metrics:
-                        self._metrics.record_request(
-                            url=url, success=True, duration=duration,
-                            status=resp.status, proxy=proxy, attempt=attempt,
-                        )
+                    self._record_request(
+                        url=url,
+                        success=True,
+                        duration=duration,
+                        status=resp.status,
+                        proxy=proxy,
+                        attempt=attempt,
+                    )
                     return body, duration
 
             except BlockedError:
@@ -178,26 +171,29 @@ class EgyCarPartsScraper(BaseScraper):
                 await asyncio.sleep(2 ** attempt)
 
             except (UnicodeDecodeError, aiohttp.ContentTypeError):
-                # Brotli decode failure fallback: retry with conservative encoding
                 logger.warning(
-                    "Decode error on %s (attempt %d) – retrying with gzip/deflate only",
-                    url, attempt,
+                    "Decode error on %s (attempt %d) - retrying with gzip/deflate only",
+                    url,
+                    attempt,
                 )
-                headers = {
-                    **headers,
-                    "Accept-Encoding": "gzip, deflate",
-                }
+                retry_headers = {**headers, "Accept-Encoding": "gzip, deflate"}
                 try:
                     async with self._session.get(
-                        url, headers=headers, proxy=proxy, allow_redirects=True
+                        url,
+                        headers=retry_headers,
+                        proxy=proxy,
+                        allow_redirects=True,
                     ) as resp2:
                         body = await resp2.text(errors="replace")
                         duration = time.monotonic() - t0
-                        if self._metrics:
-                            self._metrics.record_request(
-                                url=url, success=True, duration=duration,
-                                status=resp2.status, proxy=proxy, attempt=attempt,
-                            )
+                        self._record_request(
+                            url=url,
+                            success=True,
+                            duration=duration,
+                            status=resp2.status,
+                            proxy=proxy,
+                            attempt=attempt,
+                        )
                         return body, duration
                 except Exception:
                     pass
@@ -206,8 +202,12 @@ class EgyCarPartsScraper(BaseScraper):
             except aiohttp.ClientError as exc:
                 backoff = 2 ** attempt
                 logger.warning(
-                    "Attempt %d/%d failed for %s: %s – retrying in %ds",
-                    attempt, self.max_retries, url, exc, backoff,
+                    "Attempt %d/%d failed for %s: %s - retrying in %ds",
+                    attempt,
+                    self.max_retries,
+                    url,
+                    exc,
+                    backoff,
                 )
                 if proxy:
                     self._proxy_manager.mark_bad(proxy)
@@ -221,26 +221,29 @@ class EgyCarPartsScraper(BaseScraper):
         duration = time.monotonic() - t0
         logger.error("All retries exhausted for %s", url)
 
-        # Jina AI fallback
         jina_content = await fetch_via_jina(url)
         if jina_content:
             if self._metrics:
                 self._metrics.record_jina_fallback()
             return jina_content, time.monotonic() - t0
 
-        if self._metrics:
-            self._metrics.record_request(
-                url=url, success=False, duration=duration,
-                status=0, proxy=proxy, attempt=self.max_retries,
-            )
+        self._record_request(
+            url=url,
+            success=False,
+            duration=duration,
+            status=0,
+            proxy=proxy,
+            attempt=self.max_retries,
+        )
         return None, duration
 
-    # ------------------------------------------------------------------
-    # Categories
-    # ------------------------------------------------------------------
-
     async def scrape_categories(self) -> List[Dict[str, str]]:
-        """Parse category links from the main site navigation."""
+        """Parse category links from config seeds or page heuristics."""
+        seeded = self._seed_categories()
+        if seeded:
+            logger.info("Using %d seeded categories for %s", len(seeded), self.source)
+            return seeded
+
         html, _ = await self._fetch(self.base_url)
         if not html:
             return []
@@ -248,30 +251,25 @@ class EgyCarPartsScraper(BaseScraper):
         soup = BeautifulSoup(html, "lxml")
         selector = self.config.get("categories_selector", "nav ul li a")
         links = soup.select(selector)
+        if not links:
+            links = self._discover_category_links(soup)
 
         categories: List[Dict[str, str]] = []
         seen: set[str] = set()
         for tag in links:
             href = tag.get("href", "")
-            name = tag.get_text(strip=True)
+            name = tag.get_text(" ", strip=True)
             if not href or not name:
                 continue
             url = self._absolute_url(href)
-            if url in seen or any(
-                kw in url
-                for kw in ("/account", "/cart", "/search", "/blogs", "/pages")
-            ):
+            lower = url.lower()
+            if url in seen or any(pattern in lower for pattern in self._category_excludes()):
                 continue
             seen.add(url)
             categories.append({"name": name, "url": url})
-            logger.debug("Category: %s -> %s", name, url)
 
-        logger.info("Found %d categories", len(categories))
+        logger.info("Found %d categories for %s", len(categories), self.source)
         return categories
-
-    # ------------------------------------------------------------------
-    # Product listing (one category, all pages)
-    # ------------------------------------------------------------------
 
     async def scrape_products_from_category(
         self,
@@ -281,6 +279,7 @@ class EgyCarPartsScraper(BaseScraper):
     ) -> List[Dict[str, Any]]:
         """Paginate through a category and return all product stubs."""
         products: List[Dict[str, Any]] = []
+        seen_urls: set[str] = set()
         page_num = start_page
         page_url: Optional[str] = self._page_url(category_url, page_num)
 
@@ -291,20 +290,17 @@ class EgyCarPartsScraper(BaseScraper):
                 break
 
             soup = BeautifulSoup(html, "lxml")
-            container_sel = self.config.get(
-                "product_container", "ul.product-grid li"
-            )
-            items = soup.select(container_sel)
-            if not items:
+            page_products = self._extract_products_from_page(soup, category_name)
+            if not page_products:
                 logger.debug("No product cards on %s", page_url)
                 break
 
-            for item in items:
-                product = self._extract_listing_product(item, category_name)
-                if product:
+            for product in page_products:
+                product_url = product.get("url", "")
+                if product_url and product_url not in seen_urls:
+                    seen_urls.add(product_url)
                     products.append(product)
 
-            # Pagination
             next_sel = self.config.get("next_page", "a.pagination__next")
             next_tag = soup.select_one(next_sel)
             if next_tag and next_tag.get("href"):
@@ -316,58 +312,156 @@ class EgyCarPartsScraper(BaseScraper):
 
         logger.info(
             "Category '%s' yielded %d products",
-            category_name or category_url, len(products),
+            category_name or category_url,
+            len(products),
         )
         return products
 
     def _page_url(self, base: str, page: int) -> str:
-        """Construct a Shopify paginated URL (e.g. ?page=3)."""
+        """Construct a paginated URL using config-driven rules."""
         if page <= 1:
             return base
+
+        template = self.config.get("page_url_template")
+        if template:
+            return template.format(url=base, page=page)
+
+        if self.config.get("pagination_style") == "path":
+            return base.rstrip("/") + f"/page/{page}/"
+
         parts = list(urlparse(base))
         params = parse_qs(parts[4])
-        params["page"] = [str(page)]
+        params[self.config.get("page_param_name", "page")] = [str(page)]
         parts[4] = urlencode({k: v[0] for k, v in params.items()})
         return urlunparse(parts)
+
+    def _extract_products_from_page(
+        self, soup: BeautifulSoup, category_name: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        container_sel = self.config.get("product_container", "ul.product-grid li")
+        items = soup.select(container_sel)
+
+        products: List[Dict[str, Any]] = []
+        if not items:
+            logger.info(
+                "No product containers matched '%s' on %s; falling back to anchor discovery",
+                container_sel,
+                category_name or self.source,
+            )
+            return self._extract_products_from_anchors(soup, category_name)
+
+        for item in items:
+            product = self.extract_product_from_listing(item, category_name)
+            if product:
+                products.append(product)
+        if products:
+            return products
+
+        logger.info(
+            "Product containers matched '%s' on %s but yielded no valid products; falling back to anchor discovery",
+            container_sel,
+            category_name or self.source,
+        )
+
+        return self._extract_products_from_anchors(soup, category_name)
 
     def _extract_listing_product(
         self, item: Any, category_name: Optional[str]
     ) -> Optional[Dict[str, Any]]:
-        """Extract lightweight product data from a listing card using first_match."""
+        """Extract lightweight product data from a card or direct anchor."""
         title_sel = self.config.get("product_title", ".product-title, h3")
         price_sel = self.config.get("price_selector", ".price")
         vendor_sel = self.config.get("vendor_selector", ".vendor")
         link_sel = self.config.get("product_link", "a")
+        title_selectors = [(selector, None) for selector in _split_selectors(title_sel)]
+        price_selectors = [(selector, None) for selector in _split_selectors(price_sel)]
+        vendor_selectors = [(selector, None) for selector in _split_selectors(vendor_sel)]
 
-        link_tag = item.select_one(link_sel)
-        if not link_tag:
+        if getattr(item, "name", None) == "a":
+            candidate = item if item.get("href") else None
+            if candidate and any(
+                pattern in self._absolute_url(candidate.get("href", "")).lower()
+                for pattern in self._product_patterns()
+            ):
+                link_tag = candidate
+            else:
+                link_tag = item.select_one(link_sel) or item.select_one("a[href]")
+        else:
+            link_tag = item.select_one(link_sel) or item.select_one("a")
+
+        href = link_tag.get("href", "") if link_tag else ""
+        if href.startswith("#"):
+            url = self.build_synthetic_fragment_url(href)
+        else:
+            url = self._absolute_url(href) if link_tag else ""
+
+        part_number = self._extract_part_number(item, link_tag)
+        material_id = part_number or (
+            item.get("data-material-id", "") if hasattr(item, "get") else ""
+        )
+        if not url and material_id:
+            url = self.build_synthetic_fragment_url(f"#material-{material_id}")
+        if not url:
             return None
 
-        url = self._absolute_url(link_tag.get("href", ""))
+        name = first_match(
+            item,
+            title_selectors + [("h3", None), ("h2", None), ("img", "alt")],
+        ) or (
+            link_tag.get("title", "") if link_tag else ""
+        ) or (
+            link_tag.get_text(" ", strip=True) if link_tag else ""
+        )
+        name = re.sub(r"\s+", " ", name).strip()
+        image_alt_name = first_match(item, [("img", "alt")]) or ""
+        if name.endswith("...") and image_alt_name:
+            name = image_alt_name
+        if not name and material_id:
+            name = material_id
 
-        name = first_match(item, [
-            (title_sel, None),
-            ("h3", None),
-            ("h2", None),
-        ]) or link_tag.get_text(strip=True)
+        raw_price = first_match(
+            item,
+            price_selectors
+            + [
+                (".money", None),
+                ("[class*='price']", None),
+                ("[itemprop='price']", "content"),
+            ],
+        ) or ""
 
-        raw_price = first_match(item, [
-            (price_sel, None),
-            (".money", None),
-            ("[class*='price']", None),
-        ]) or ""
+        vendor = first_match(
+            item,
+            vendor_selectors + [(".brand", None), ("[itemprop='brand']", None)],
+        ) or ""
 
-        vendor = first_match(item, [
-            (vendor_sel, None),
-            (".brand", None),
-        ]) or ""
+        image_url = first_match(
+            item,
+            [
+                ("img", "src"),
+                ("img", "data-src"),
+                ("img", "data-lazy"),
+            ],
+        ) or ""
+        if image_url.startswith("data:image/"):
+            image_url = ""
+        if image_url.startswith("//"):
+            image_url = "https:" + image_url
 
-        image_url = ""
-        img_tag = item.select_one("img")
-        if img_tag:
-            image_url = img_tag.get("src") or img_tag.get("data-src") or ""
-            if image_url.startswith("//"):
-                image_url = "https:" + image_url
+        lowered_name = name.lower()
+        if not name and not raw_price and not material_id:
+            return None
+        if re.fullmatch(r"-?\d+%", name):
+            return None
+        if lowered_name in {"quick view", "عرض سريع"}:
+            return None
+
+        stock_text = item.get_text(" ", strip=True).lower()
+        if "out of stock" in stock_text or "sold out" in stock_text:
+            stock_status = "out_of_stock"
+        elif "in stock" in stock_text or "add to cart" in stock_text:
+            stock_status = "in_stock"
+        else:
+            stock_status = "unknown"
 
         return {
             "name": name,
@@ -375,54 +469,77 @@ class EgyCarPartsScraper(BaseScraper):
             "price": clean_price(raw_price),
             "raw_price": raw_price,
             "vendor": vendor,
-            "part_number": "",
+            "part_number": clean_part_number(material_id),
             "image_url": image_url,
-            "stock_status": "",
+            "stock_status": stock_status,
             "category": category_name or "",
-            "source": "egycarparts",
+            "source": self.source,
+            "data_source": "listing",
+            "listing_only": bool(self.config.get("extract_from_listing") or "#material-" in url),
         }
 
-    # ------------------------------------------------------------------
-    # Product detail page
-    # ------------------------------------------------------------------
-
     async def scrape_product_details(self, product_url: str) -> Dict[str, Any]:
-        """
-        Fetch a product page and return full details.
+        """Fetch a product page and return full details."""
+        if "#material-" in product_url:
+            return self._extract_details_from_listing_reference(product_url)
 
-        Priority:
-          1. Shopify embedded JSON (most accurate).
-          2. HTML parsing with CSS selector cascade.
-          3. LLM extraction (if --llm is enabled and selectors fail).
-        """
         html, _ = await self._fetch(product_url)
         if not html:
             return {"url": product_url, "error": "fetch_failed"}
 
+        storefront_type = detect_storefront_type(html, self.config)
         shopify_data = extract_shopify_product_json(html)
-        if shopify_data:
+        if storefront_type == "shopify" and shopify_data:
             return self._parse_shopify_json(shopify_data, product_url)
 
         result = self._parse_product_html(html, product_url)
 
-        # LLM fallback when CSS selectors yielded no name
         if not result.get("name") and self.llm_enabled:
-            logger.info("CSS selectors empty – trying LLM extraction for %s", product_url)
+            logger.info("CSS selectors empty - trying LLM extraction for %s", product_url)
             from utils.llm_extractor import extract_with_llm
+
             llm_data = await extract_with_llm(html)
             if llm_data:
                 if self._metrics:
                     self._metrics.record_llm_extraction()
-                result.update({
-                    "name": llm_data.get("name", result.get("name", "")),
-                    "vendor": llm_data.get("brand", result.get("vendor", "")),
-                    "part_number": llm_data.get("part_number", result.get("part_number", "")),
-                    "price": llm_data.get("price") or result.get("price"),
-                    "description": llm_data.get("description", result.get("description", "")),
-                    "data_source": "llm_extraction",
-                })
+                result.update(
+                    {
+                        "name": llm_data.get("name", result.get("name", "")),
+                        "vendor": llm_data.get("brand", result.get("vendor", "")),
+                        "part_number": llm_data.get(
+                            "part_number",
+                            result.get("part_number", ""),
+                        ),
+                        "price": llm_data.get("price") or result.get("price"),
+                        "description": llm_data.get(
+                            "description",
+                            result.get("description", ""),
+                        ),
+                        "data_source": "llm_extraction",
+                    }
+                )
 
         return result
+
+    def extract_details_from_listing(
+        self,
+        item: Any,
+        product: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not (self.config.get("extract_from_listing") or "#material-" in product.get("url", "")):
+            return {}
+
+        description = re.sub(r"\s+", " ", item.get_text(" ", strip=True)).strip()
+        if description == product.get("name", ""):
+            description = ""
+
+        return {
+            "description": description,
+            "specifications": {},
+            "variants": [],
+            "data_source": "listing_only",
+            "listing_only": True,
+        }
 
     def _parse_shopify_json(self, data: Dict[str, Any], url: str) -> Dict[str, Any]:
         """Map Shopify product JSON to the canonical schema."""
@@ -431,12 +548,17 @@ class EgyCarPartsScraper(BaseScraper):
         images = data.get("images", []) or data.get("media", [])
         image_url = ""
         if images:
-            src = images[0].get("src") or images[0].get("original_src") or ""
+            first_image = images[0]
+            if isinstance(first_image, dict):
+                src = first_image.get("src") or first_image.get("original_src") or ""
+            else:
+                src = str(first_image)
             image_url = ("https:" + src) if src.startswith("//") else src
 
         specs: Dict[str, str] = {}
         for opt in data.get("options", []):
-            specs[opt.get("name", "")] = ", ".join(opt.get("values", []))
+            if isinstance(opt, dict):
+                specs[opt.get("name", "")] = ", ".join(opt.get("values", []))
 
         return {
             "url": url,
@@ -454,75 +576,102 @@ class EgyCarPartsScraper(BaseScraper):
             "specifications": specs,
             "variants": [
                 {
-                    "title": v.get("title"),
-                    "sku": v.get("sku"),
-                    "price": clean_price(str(v.get("price", ""))),
-                    "available": v.get("available"),
+                    "title": variant.get("title"),
+                    "sku": variant.get("sku"),
+                    "price": clean_price(str(variant.get("price", ""))),
+                    "available": variant.get("available"),
                 }
-                for v in variants
+                for variant in variants
+                if isinstance(variant, dict)
             ],
             "tags": data.get("tags", []),
-            "source": "egycarparts",
+            "source": self.source,
             "data_source": "shopify_json",
         }
 
     def _parse_product_html(self, html: str, url: str) -> Dict[str, Any]:
         """HTML fallback for product pages without embedded JSON."""
         soup = BeautifulSoup(html, "lxml")
+        jsonld_product = self._extract_jsonld_product(soup, url)
+        if jsonld_product:
+            return jsonld_product
 
-        name = first_match(soup, [
-            ("h1.product-title", None),
-            ("h1.product__title", None),
-            ("h1", None),
-            ('meta[property="og:title"]', "content"),
-        ]) or ""
+        name = first_match(
+            soup,
+            [
+                ("h1.product-title", None),
+                ("h1.product__title", None),
+                ("h1", None),
+                ('meta[property="og:title"]', "content"),
+            ],
+        ) or ""
 
-        raw_price = first_match(soup, [
-            (".price__current", None),
-            (".product__price", None),
-            (".price", None),
-            ('meta[property="og:price:amount"]', "content"),
-        ]) or ""
+        raw_price = first_match(
+            soup,
+            [
+                (".price__current", None),
+                (".product__price", None),
+                (".price", None),
+                ("[itemprop='price']", "content"),
+                ('meta[property="og:price:amount"]', "content"),
+            ],
+        ) or ""
 
-        vendor = first_match(soup, [
-            (".product__vendor", None),
-            (".vendor", None),
-        ]) or ""
+        vendor = first_match(
+            soup,
+            [
+                (".product__vendor", None),
+                (".vendor", None),
+                ("[itemprop='brand']", None),
+            ],
+        ) or ""
 
-        sku = first_match(soup, [
-            (".product__sku", None),
-            (".sku", None),
-        ]) or ""
+        sku = first_match(
+            soup,
+            [
+                (".product__sku", None),
+                (".sku", None),
+                ("[itemprop='sku']", None),
+            ],
+        ) or ""
 
-        description = first_match(soup, [
-            (".product__description", None),
-            ("#product-description", None),
-            (".description", None),
-        ]) or ""
+        description = first_match(
+            soup,
+            [
+                (".product__description", None),
+                ("#product-description", None),
+                (".description", None),
+                ("[itemprop='description']", None),
+            ],
+        ) or ""
 
-        image_url = first_match(soup, [
-            (".product__media img", "src"),
-            (".product-image img", "src"),
-            ('meta[property="og:image"]', "content"),
-        ]) or ""
+        image_url = first_match(
+            soup,
+            [
+                (".product__media img", "src"),
+                (".product-image img", "src"),
+                ('meta[property="og:image"]', "content"),
+            ],
+        ) or ""
         if image_url.startswith("//"):
             image_url = "https:" + image_url
 
         specs: Dict[str, str] = {}
-        for row in soup.select("table.product-specs tr, .specifications tr"):
+        for row in soup.select("table.product-specs tr, .specifications tr, table tr"):
             cells = row.select("td, th")
             if len(cells) >= 2:
-                specs[cells[0].get_text(strip=True)] = cells[1].get_text(strip=True)
+                key = cells[0].get_text(" ", strip=True)
+                value = cells[1].get_text(" ", strip=True)
+                if key and value:
+                    specs[key] = value
 
-        stock_el = soup.select_one(".product__availability, .stock-status")
-        stock_text = stock_el.get_text(strip=True).lower() if stock_el else ""
-        stock_status = (
-            "in_stock"
-            if "in stock" in stock_text or "available" in stock_text
-            else "out_of_stock"
-            if "out of stock" in stock_text
-            else "unknown"
-        )
+        stock_text = soup.get_text(" ", strip=True).lower()
+        if "out of stock" in stock_text or "sold out" in stock_text:
+            stock_status = "out_of_stock"
+        elif "in stock" in stock_text or "add to cart" in stock_text:
+            stock_status = "in_stock"
+        else:
+            stock_status = "unknown"
 
         return {
             "url": url,
@@ -536,16 +685,244 @@ class EgyCarPartsScraper(BaseScraper):
             "description": description,
             "specifications": specs,
             "variants": [],
-            "source": "egycarparts",
+            "source": self.source,
             "data_source": "html_fallback",
         }
 
+    def _seed_categories(self) -> List[Dict[str, str]]:
+        return super()._seed_categories()
 
-# ---------------------------------------------------------------------------
-# Module helpers
-# ---------------------------------------------------------------------------
+    def _category_excludes(self) -> List[str]:
+        return [
+            pattern.lower()
+            for pattern in self.config.get(
+                "category_exclude_patterns",
+                [
+                    "/account",
+                    "/cart",
+                    "/search",
+                    "/blogs",
+                    "/pages",
+                    "/compare",
+                    "/wishlist",
+                    "/product-page/",
+                ],
+            )
+        ]
+
+    def _product_patterns(self) -> List[str]:
+        return [
+            pattern.lower()
+            for pattern in self.config.get(
+                "product_link_patterns",
+                [
+                    "/products/",
+                    "/product/",
+                    "/product-detail/",
+                    "/product-page/",
+                    "-parts-",
+                ],
+            )
+        ]
+
+    def _discover_category_links(self, soup: BeautifulSoup) -> List[Any]:
+        patterns = [
+            pattern.lower()
+            for pattern in self.config.get(
+                "category_link_patterns",
+                [
+                    "/collections/",
+                    "/category/",
+                    "/product-category/",
+                    "/shop?category=",
+                    "/products?product_type=",
+                    "/products?category_id=",
+                    "-parts-",
+                    "/categories/",
+                ],
+            )
+        ]
+
+        discovered: List[Any] = []
+        for tag in soup.select("a[href]"):
+            href = tag.get("href", "")
+            url = self._absolute_url(href)
+            lower = url.lower()
+            if any(excluded in lower for excluded in self._category_excludes()):
+                continue
+            if any(pattern in lower for pattern in patterns):
+                if any(pattern in lower for pattern in self._product_patterns()):
+                    continue
+                discovered.append(tag)
+        return discovered
+
+    def _extract_products_from_anchors(
+        self, soup: BeautifulSoup, category_name: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        products: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for tag in soup.select("a[href]"):
+            href = tag.get("href", "")
+            url = self._absolute_url(href)
+            lower = url.lower()
+            if not any(pattern in lower for pattern in self._product_patterns()):
+                continue
+            if any(excluded in lower for excluded in self._category_excludes()):
+                continue
+            if url in seen:
+                continue
+            product = self.extract_product_from_listing(tag, category_name)
+            if product:
+                seen.add(url)
+                products.append(product)
+        return products
+
+    def _extract_part_number(self, item: Any, link_tag: Optional[Any] = None) -> str:
+        selector = self.config.get("part_number_selector", "")
+        attribute = self.config.get("part_number_attribute")
+        selectors = _split_selectors(selector)
+        if selectors:
+            pairs = [(sel, attribute) for sel in selectors] if attribute else [
+                (sel, None) for sel in selectors
+            ]
+            value = first_match(item, pairs) or ""
+            if value:
+                return clean_part_number(value)
+
+        for candidate in (item, link_tag):
+            if candidate is None or not hasattr(candidate, "get"):
+                continue
+            for attr in ("data-material-id", "data-part-number", "data-sku", "data-sku-id"):
+                value = candidate.get(attr, "")
+                if value:
+                    return clean_part_number(value)
+
+        text = item.get_text(" ", strip=True) if hasattr(item, "get_text") else ""
+        match = re.search(
+            r"(?:part\s*(?:no\.?|number)?|sku|oem|ref\.?)\s*[:#-]?\s*([A-Z0-9][A-Z0-9._/-]{2,})",
+            text,
+            re.I,
+        )
+        if match:
+            return clean_part_number(match.group(1))
+        return ""
+
+    def _extract_details_from_listing_reference(self, product_url: str) -> Dict[str, Any]:
+        fragment = product_url.split("#material-", 1)[-1] if "#material-" in product_url else ""
+        return {
+            "url": product_url,
+            "part_number": clean_part_number(fragment),
+            "description": "",
+            "specifications": {},
+            "variants": [],
+            "source": self.source,
+            "data_source": "listing_only",
+            "listing_only": True,
+            "notes": self._listing_only_note(product_url),
+        }
+
+    def _extract_jsonld_product(
+        self, soup: BeautifulSoup, url: str
+    ) -> Optional[Dict[str, Any]]:
+        for script in soup.select('script[type="application/ld+json"]'):
+            raw = script.string or script.get_text(strip=True)
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            stack = [payload]
+            while stack:
+                current = stack.pop()
+                if isinstance(current, list):
+                    stack.extend(current)
+                    continue
+                if not isinstance(current, dict):
+                    continue
+                if "@graph" in current:
+                    stack.extend(current["@graph"])
+                    continue
+
+                current_type = current.get("@type", [])
+                if isinstance(current_type, str):
+                    current_types = [current_type.lower()]
+                else:
+                    current_types = [str(item).lower() for item in current_type]
+
+                if "product" not in current_types:
+                    continue
+
+                offers = current.get("offers", {})
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+
+                brand = current.get("brand", "")
+                if isinstance(brand, dict):
+                    brand = brand.get("name", "")
+
+                image = current.get("image", "")
+                if isinstance(image, list):
+                    image = image[0] if image else ""
+
+                availability = str(offers.get("availability", "")).lower()
+                if "instock" in availability:
+                    stock_status = "in_stock"
+                elif "outofstock" in availability:
+                    stock_status = "out_of_stock"
+                else:
+                    stock_status = "unknown"
+
+                return {
+                    "url": url,
+                    "name": current.get("name", ""),
+                    "vendor": brand,
+                    "part_number": clean_part_number(
+                        current.get("sku")
+                        or current.get("mpn")
+                        or current.get("productID", "")
+                    ),
+                    "price": clean_price(str(offers.get("price", ""))),
+                    "raw_price": str(offers.get("price", "")),
+                    "image_url": image,
+                    "stock_status": stock_status,
+                    "description": _strip_html(current.get("description", "")),
+                    "specifications": {},
+                    "variants": [],
+                    "source": self.source,
+                    "data_source": "jsonld_product",
+                }
+        return None
+
+    def _record_request(
+        self,
+        *,
+        url: str,
+        success: bool,
+        duration: float,
+        status: int,
+        proxy: Optional[str],
+        attempt: int,
+        blocked: bool = False,
+    ) -> None:
+        if self._metrics:
+            self._metrics.record_request(
+                url=url,
+                success=success,
+                duration=duration,
+                status=status,
+                proxy=proxy,
+                attempt=attempt,
+                blocked=blocked,
+            )
+
 
 def _strip_html(html_str: str) -> str:
     if not html_str:
         return ""
     return BeautifulSoup(html_str, "lxml").get_text(separator=" ", strip=True)
+
+
+def _split_selectors(value: str) -> List[str]:
+    return [selector.strip() for selector in value.split(",") if selector.strip()]

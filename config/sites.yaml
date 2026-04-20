@@ -1,61 +1,375 @@
-# Scrapyard – Site configuration
-# --------------------------------
-# Add new sites by copying the block structure below and updating the selectors.
-# Required fields: base_url, type
-# Optional fields: everything else (sensible defaults apply in code)
+# Scrapyard v3.1 live site configuration
+# --------------------------------------
+# Site ids are the values you pass to `--site`.
+# Notes document live quirks observed during smoke testing.
 
-egycarparts:
+tawfiqia: &tawfiqia
+  display_name: "Tawfiqia"
+  base_url: "https://tawfiqia.com/en"
+  type: "custom"
+  platform_type: "Custom"
+  currency: "EGP"
+  engine: "http"
+  categories_selector: 'a[href*="/shop?category="]'
+  category_link_patterns:
+    - "/shop?category="
+  product_container: "div.product"
+  product_link: 'a[href*="/product-detail/"]'
+  product_link_patterns:
+    - "/product-detail/"
+  product_title: 'a[href*="/product-detail/"], h3, h2'
+  price_selector: ".price, [class*='price']"
+  vendor_selector: ".vendor, .brand"
+  next_page: 'a[rel="next"], .pagination a[rel="next"], a.next'
+  use_javascript: false
+  request_delay_min: 1.0
+  request_delay_max: 2.5
+  max_retries: 3
+  timeout: 30
+  max_pages: 10
+  notes: "Standard custom storefront with crawlable category and product URLs."
+
+elcatalog: &elcatalog
+  display_name: "El Catalog"
+  base_url: "https://www.el-catalog.store"
+  type: "custom"
+  platform_type: "Shopify"
+  currency: "EGP"
+  engine: "http"
+  categories_selector: 'a[href*="/collections/"]'
+  category_link_patterns:
+    - "/collections/"
+  category_exclude_patterns:
+    - "/account"
+    - "/cart"
+    - "/search"
+    - "/pages"
+    - "/blogs"
+  product_container: "div.product-card, div.product-item, [class*='product-card']"
+  product_link: 'a[href*="/products/"]'
+  product_link_patterns:
+    - "/products/"
+  product_title: 'a[href*="/products/"], .product-title, h3, h2'
+  price_selector: ".price, .price-item, [class*='price']"
+  vendor_selector: ".vendor, .brand, .product__vendor"
+  next_page: 'a[rel="next"], a[href*="page="]'
+  use_javascript: false
+  request_delay_min: 1.0
+  request_delay_max: 2.5
+  max_retries: 3
+  timeout: 30
+  max_pages: 10
+  notes: "Shopify-like storefront. Auto-detection will use embedded Shopify product JSON even when type remains custom."
+
+el_catalog:
+  <<: *elcatalog
+
+autospare: &autospare
+  display_name: "Autospare Egypt"
+  base_url: "https://autospare.com.eg"
+  type: "custom"
+  platform_type: "Custom"
+  currency: "EGP"
+  engine: "http"
+  categories_selector: 'a[href*="/category/"]'
+  category_link_patterns:
+    - "/category/"
+  product_container: 'a[href*="/products/"]'
+  product_link: 'a[href*="/products/"]'
+  product_link_patterns:
+    - "/products/"
+  product_title: 'a[href*="/products/"], h3, h2'
+  price_selector: ".price, [class*='price']"
+  vendor_selector: ".vendor, .brand"
+  next_page: 'a[rel="next"], a[href*="page="]'
+  use_javascript: false
+  request_delay_min: 1.0
+  request_delay_max: 2.5
+  max_retries: 3
+  timeout: 30
+  max_pages: 10
+  notes: "Custom Arabic storefront with normal category and product pages."
+
+pringi: &pringi
+  display_name: "Pringi"
+  base_url: "https://pringi.com"
+  type: "custom"
+  platform_type: "WooCommerce"
+  currency: "EGP"
+  engine: "http"
+  categories_selector: 'a[href*="/product-category/"]'
+  category_link_patterns:
+    - "/product-category/"
+  product_container: "div.product, li.product"
+  product_link: 'a[href*="/product/"]'
+  product_link_patterns:
+    - "/product/"
+  product_title: ".woocommerce-loop-product__title, h3, h2, a[href*='/product/']"
+  price_selector: ".price, .woocommerce-Price-amount, [class*='price']"
+  vendor_selector: ".vendor, .brand"
+  next_page: "a.next.page-numbers, a[rel='next']"
+  use_javascript: false
+  request_delay_min: 1.0
+  request_delay_max: 2.5
+  max_retries: 3
+  timeout: 30
+  max_pages: 10
+  notes: "WooCommerce/custom storefront. Use the generic HTTP engine; Shopify parsing only applies if a page actually exposes Shopify JSON."
+
+fitandfix: &fitandfix
+  display_name: "Fit and Fix"
+  base_url: "https://www.fitandfix.com"
+  type: "custom"
+  platform_type: "Custom JS"
+  currency: "EGP"
+  engine: "playwright"
+  seed_categories:
+    - name: "Spare Parts"
+      url: "https://www.fitandfix.com/categories/spare-parts"
+  product_container: ".ProductCard"
+  product_link: 'a[href*="/products/"]'
+  product_link_patterns:
+    - "/products/"
+  product_title: "img[alt], .product-name, a[href*='/products/']"
+  price_selector: ".text-red-100, .price, [class*='price']"
+  vendor_selector: ".vendor, .brand"
+  next_page: 'a[aria-label*="Next"], a[rel="next"], a[href*="page="]'
+  use_javascript: true
+  wait_until: "domcontentloaded"
+  post_nav_delay_ms: 3000
+  request_delay_min: 1.0
+  request_delay_max: 2.0
+  max_retries: 3
+  timeout: 45
+  max_pages: 10
+  notes: "Seeded category preserved because the live category tree is JS-heavy. Product titles prefer image alt text to avoid truncated card labels."
+
+a-part: &a_part
+  display_name: "A-Part"
+  base_url: "https://a-part.com/a-part-catalogue/"
+  type: "custom"
+  platform_type: "Custom JS"
+  currency: "EGP"
+  engine: "playwright"
+  seed_categories:
+    - name: "Catalogue"
+      url: "https://a-part.com/a-part-catalogue/"
+  product_container: ".filter-producat"
+  product_link: "a"
+  product_link_patterns:
+    - "#material-"
+  product_title: "img[alt], .filter-producat"
+  part_number_selector: "[data-material-id], img[data-material-id]"
+  part_number_attribute: "data-material-id"
+  price_selector: ".price"
+  vendor_selector: ".vendor, .brand"
+  pre_extract_click_selector: ".btn-show"
+  pagination_button_selector: "button"
+  extract_from_listing: true
+  use_javascript: true
+  wait_until: "domcontentloaded"
+  post_nav_delay_ms: 4000
+  post_click_delay_ms: 1800
+  scroll_steps: 2
+  request_delay_min: 1.0
+  request_delay_max: 1.5
+  max_retries: 3
+  timeout: 45
+  max_pages: 3
+  notes: "Fragment-only catalogue. Product detail links resolve to #material-... and are represented with synthetic URLs while details stay on the listing card."
+
+apart:
+  <<: *a_part
+
+a_part:
+  <<: *a_part
+
+yourparts: &yourparts
+  display_name: "YourParts"
+  base_url: "https://www.yourparts.com"
+  type: "custom"
+  platform_type: "Next.js"
+  currency: "EGP"
+  engine: "playwright"
+  categories_selector: 'a[href*="/products?product_type="], a[href*="/products?category_id="]'
+  category_link_patterns:
+    - "/products?product_type="
+    - "/products?category_id="
+  product_container: 'a[href*="/products/"]'
+  product_link: 'a[href*="/products/"]'
+  product_link_patterns:
+    - "/products/"
+  product_title: 'a[href*="/products/"], h3, h2'
+  price_selector: ".price, [class*='price']"
+  vendor_selector: ".vendor, .brand"
+  next_page: 'a[aria-label*="Next"], a[rel="next"], a[href*="page="]'
+  use_javascript: true
+  wait_until: "domcontentloaded"
+  post_nav_delay_ms: 3000
+  request_delay_min: 1.0
+  request_delay_max: 2.0
+  max_retries: 3
+  timeout: 45
+  max_pages: 10
+  notes: "JS-rendered product grid. Categories are discoverable through product_type/category_id query links."
+
+elkhaberstores: &elkhaberstores
+  display_name: "Elkhaber Stores"
+  base_url: "https://elkhaberstores.com"
+  type: "custom"
+  platform_type: "Custom Arabic Store"
+  currency: "EGP"
+  engine: "playwright"
+  seed_categories:
+    - name: "Featured"
+      url: "https://elkhaberstores.com/"
+  product_container: "div.product-layout"
+  product_link: "a.product-img, .name a, a[href]"
+  product_link_patterns:
+    - "elkhaberstores.com/"
+  product_title: "div.name, img[alt], .name a"
+  price_selector: ".price-new, span.price, .product-price, .price"
+  vendor_selector: "span.brand-name, .vendor"
+  use_javascript: true
+  locale: "ar-EG"
+  accept_language: "ar,en-US;q=0.9"
+  wait_until: "domcontentloaded"
+  post_nav_delay_ms: 3000
+  request_delay_min: 2.0
+  request_delay_max: 4.0
+  max_retries: 3
+  timeout: 60
+  max_pages: 5
+  notes: "Arabic storefront. Seeded home/featured page is preserved because it is more reliable than menu discovery."
+
+alkhaleeg:
+  <<: *elkhaberstores
+
+egycarparts: &egycarparts
+  display_name: "Egy Car Parts"
   base_url: "https://egycarparts.com"
   type: "shopify"
-  categories_selector: "nav ul li a"
-  product_container: "ul.product-grid li, div.product-item, div.product-card"
-  product_link: "a"
-  product_title: ".product-title, h3"
-  price_selector: ".price, .product-price"
-  vendor_selector: ".vendor, .brand"
-  next_page: "a.pagination__next"
+  platform_type: "Shopify"
+  currency: "EGP"
+  engine: "http"
+  categories_selector: 'a[href*="/collections/"]'
+  category_link_patterns:
+    - "/collections/"
+  category_exclude_patterns:
+    - "/account"
+    - "/cart"
+    - "/search"
+    - "/pages"
+    - "/blogs"
+  product_container: "ul.product-grid li, div.product-item, [class*='product-card']"
+  product_link: 'a[href*="/products/"]'
+  product_link_patterns:
+    - "/products/"
+  product_title: ".product-title, h3, h2"
+  price_selector: ".price, .product-price, .price__current"
+  vendor_selector: ".vendor, .brand, .product__vendor"
+  next_page: 'a[rel="next"], a.pagination__next'
   use_javascript: false
   request_delay_min: 1.0
   request_delay_max: 3.0
   max_retries: 3
   timeout: 30
   max_pages: 10
+  notes: "Native Shopify store. Embedded product JSON is preferred for detail pages."
 
-# Al Khaleeg / Elkhabers Stores – Arabic custom site
-# NOTE: Replace base_url with the actual site URL once you have scraping permission.
-#       If the URL is invalid or the site is unreachable, the scraper will log a
-#       warning and exit gracefully without crashing.
-alkhaleeg:
-  base_url: "https://elkhaberstores.com"
+partfinderegypt: &partfinderegypt
+  display_name: "Part Finder Egypt"
+  base_url: "https://www.partfinderegypt.com"
   type: "custom"
-  categories_selector: "div.menu-categories a, ul.brands-list a"
-  product_container: "div.product-item, li.product"
-  product_link: "a.product-img"
-  product_title: "h4.product-name"
-  price_selector: "span.price"
-  vendor_selector: "span.brand-name"
-  next_page: "a.next-page"
+  platform_type: "Inventory Lookup"
+  currency: "EGP"
+  engine: "http"
+  seed_categories:
+    - name: "Hyundai"
+      url: "https://www.partfinderegypt.com/hyundai-parts-67345"
+    - name: "Nissan"
+      url: "https://www.partfinderegypt.com/nissan-parts-67358"
+    - name: "Fiat"
+      url: "https://www.partfinderegypt.com/fiat-parts-67339"
+  categories_selector: 'a[href*="-parts-"]'
+  category_link_patterns:
+    - "-parts-"
+  category_exclude_patterns:
+    - "/members/"
+    - "/cart"
+    - "/search"
+  product_container: 'a[href*="-parts-"]'
+  product_link: 'a[href*="-parts-"]'
+  product_link_patterns:
+    - "-parts-"
+  product_title: 'a[href*="-parts-"], h3, h2'
+  price_selector: ".price, [class*='price']"
+  vendor_selector: ".vendor, .brand"
+  use_javascript: false
+  request_delay_min: 1.0
+  request_delay_max: 2.0
+  max_retries: 3
+  timeout: 30
+  max_pages: 5
+  notes: "Inventory lookup by brand/model rather than a traditional category tree. Seeded brand pages are the reliable entry points."
+
+elboltygroup: &elboltygroup
+  display_name: "El Bolty Group"
+  base_url: "https://www.elboltygroup.com/shop-1"
+  type: "custom"
+  platform_type: "Wix"
+  currency: "EGP"
+  engine: "playwright"
+  seed_categories:
+    - name: "Shop"
+      url: "https://www.elboltygroup.com/shop-1"
+  product_container: 'a[data-hook="product-item-product-details-link"]'
+  product_link: 'a[data-hook="product-item-product-details-link"], a[href*="/product-page/"]'
+  product_link_patterns:
+    - "/product-page/"
+  product_title: '[data-hook="product-item-name"], a.JPDEZd, h3, h2'
+  price_selector: '[data-hook="product-item-price-to-pay"], [data-wix-price], .price, [class*="price"]'
+  vendor_selector: ".vendor, .brand"
   use_javascript: true
-  request_delay_min: 2.0
-  request_delay_max: 5.0
+  wait_until: "domcontentloaded"
+  post_nav_delay_ms: 4000
+  request_delay_min: 1.0
+  request_delay_max: 2.0
   max_retries: 3
   timeout: 60
-  max_pages: 5
+  max_pages: 10
+  notes: "Wix storefront. Seeded shop page is preserved because it is the most stable catalog entry point."
 
-# ── Template for new sites ────────────────────────────────────────────────────
+# Template
+# --------
 # mysite:
+#   display_name: "My Site"
 #   base_url: "https://example.com"
-#   type: "custom"          # or "shopify"
-#   categories_selector: "nav a"
+#   type: "custom"               # or "shopify"
+#   platform_type: "Custom"
+#   currency: "EGP"
+#   engine: "http"               # or "playwright"
+#   categories_selector: 'a[href*="/category/"]'
+#   category_link_patterns:
+#     - "/category/"
 #   product_container: "div.product"
 #   product_link: "a"
-#   product_title: "h2"
+#   product_link_patterns:
+#     - "/product/"
+#   product_title: "h2, h3"
+#   part_number_selector: ".sku"
+#   part_number_attribute: null
 #   price_selector: ".price"
 #   vendor_selector: ".brand"
-#   next_page: "a.next"
+#   next_page: "a[rel='next']"
+#   seed_categories:
+#     - name: "Catalog"
+#       url: "https://example.com/catalog"
+#   extract_from_listing: false
 #   use_javascript: false
 #   request_delay_min: 1.0
 #   request_delay_max: 3.0
 #   max_retries: 3
 #   timeout: 30
 #   max_pages: 10
+#   notes: "Add any site-specific quirks here."
