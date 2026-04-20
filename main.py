@@ -302,7 +302,7 @@ def _build_run_metadata(
 
 
 def _print_summary(summary: Dict[str, Any]) -> None:
-    print("\n── Run Summary ───────────────────────────────")
+    print("\n-- Run Summary ------------------------------")
     print(f"  Site          : {summary['site']}")
     print(f"  Products      : {summary['total_products']}")
     print(f"  Categories    : {summary['categories_scraped']}")
@@ -314,7 +314,7 @@ def _print_summary(summary: Dict[str, Any]) -> None:
         print(f"  Jina fallbacks: {summary['jina_fallbacks']}")
     if summary.get("llm_extractions"):
         print(f"  LLM extracts  : {summary['llm_extractions']}")
-    print("──────────────────────────────────────────────")
+    print("---------------------------------------------")
 
 
 # ---------------------------------------------------------------------------

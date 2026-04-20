@@ -300,12 +300,34 @@ class AlKhaleegScraper(BaseScraper):
     async def _extract_products_from_rendered_page(
         self, page: Page, category_name: Optional[str]
     ) -> List[Dict[str, Any]]:
+        container_sel = self.config.get("product_container", "div.product-item, li.product")
+        wait_timeout_ms = int(self.config.get("product_wait_timeout_ms", 5000))
+        if container_sel:
+            try:
+                await page.wait_for_selector(container_sel, timeout=wait_timeout_ms)
+            except Exception:
+                logger.debug(
+                    "Product selector '%s' was not visible yet on %s",
+                    container_sel,
+                    category_name or self.source,
+                )
+
         await self._scroll_to_bottom(page)
         html = await page.content()
         soup = BeautifulSoup(html, "lxml")
         products = self._extract_products_from_page(soup, category_name)
         if products:
             return products
+
+        retry_delay_ms = int(self.config.get("empty_retry_delay_ms", 2000))
+        if retry_delay_ms > 0:
+            await page.wait_for_timeout(retry_delay_ms)
+            await self._scroll_to_bottom(page)
+            html = await page.content()
+            soup = BeautifulSoup(html, "lxml")
+            products = self._extract_products_from_page(soup, category_name)
+            if products:
+                return products
 
         pre_extract_click_selector = self.config.get("pre_extract_click_selector")
         if pre_extract_click_selector:

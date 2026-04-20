@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from hashlib import sha1
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
@@ -121,6 +123,9 @@ class DataStorage:
         data: List[Dict[str, Any]],
         filepath: str | Path,
         fmt: SyncFormat = "json",
+        *,
+        site_config: Optional[Dict[str, Any]] = None,
+        run_metadata: Optional[Dict[str, Any]] = None,
     ) -> Path:
         """
         Write *data* to *filepath* in the chosen format.
@@ -133,7 +138,7 @@ class DataStorage:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         if not data:
-            logger.warning("save() called with empty data – skipping write")
+            logger.warning("save() called with empty data - skipping write")
             return path
 
         valid, invalid = partition_products(data)
@@ -153,20 +158,25 @@ class DataStorage:
             logger.warning("No valid products to save")
             return path
 
-        dispatch = {
-            "csv":    DataStorage._save_csv,
-            "json":   DataStorage._save_json,
-            "excel":  DataStorage._save_excel,
-            "sqlite": DataStorage._save_sqlite,
-        }
-        handler = dispatch.get(fmt)
-        if handler is None:
-            raise ValueError(
-                f"Unsupported format '{fmt}'. Choose from: {list(dispatch)}"
+        if fmt == "csv":
+            DataStorage._save_csv(valid, path)
+        elif fmt == "json":
+            DataStorage._save_json(valid, path)
+        elif fmt == "excel":
+            DataStorage._save_excel(
+                valid,
+                path,
+                site_config=site_config,
+                run_metadata=run_metadata,
             )
-
-        handler(valid, path)
-        logger.info("Saved %d records → %s (%s)", len(valid), path, fmt)
+        elif fmt == "sqlite":
+            DataStorage._save_sqlite(valid, path)
+        else:
+            raise ValueError(
+                "Unsupported format "
+                f"'{fmt}'. Choose from: ['csv', 'json', 'excel', 'sqlite']"
+            )
+        logger.info("Saved %d records -> %s (%s)", len(valid), path, fmt)
         return path
 
     @staticmethod
@@ -181,19 +191,23 @@ class DataStorage:
             json.dump(data, fh, ensure_ascii=False, indent=2, default=str)
 
     @staticmethod
-    def _save_excel(data: List[Dict[str, Any]], path: Path) -> None:
-        df = DataStorage._flatten(data)
+    def _save_excel(
+        data: List[Dict[str, Any]],
+        path: Path,
+        *,
+        site_config: Optional[Dict[str, Any]] = None,
+        run_metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         out = path.with_suffix(".xlsx")
+        workbook = DataStorage._build_excel_workbook(
+            data,
+            site_config=site_config,
+            run_metadata=run_metadata,
+        )
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Products")
-            ws = writer.sheets["Products"]
-            for col in ws.columns:
-                max_len = max(
-                    (len(str(c.value)) for c in col if c.value), default=10
-                )
-                ws.column_dimensions[col[0].column_letter].width = min(
-                    max_len + 4, 60
-                )
+            for sheet_name, df in workbook.items():
+                df.to_excel(writer, index=False, sheet_name=sheet_name)
+                DataStorage._autosize_worksheet(writer.sheets[sheet_name])
 
     @staticmethod
     def _save_sqlite(data: List[Dict[str, Any]], path: Path) -> None:
@@ -341,6 +355,233 @@ class DataStorage:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_excel_workbook(
+        data: List[Dict[str, Any]],
+        *,
+        site_config: Optional[Dict[str, Any]] = None,
+        run_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        site_cfg = site_config or {}
+        meta = DataStorage._normalise_run_metadata(data, site_cfg, run_metadata)
+        products_df = DataStorage._build_products_sheet(data, site_cfg, meta)
+        vendors_df = DataStorage._build_vendors_sheet(data, site_cfg)
+        compatibility_df = DataStorage._build_compatibility_sheet(data, meta["scraped_at"])
+        categories_df = DataStorage._build_categories_sheet(data)
+        metadata_df = pd.DataFrame(
+            [
+                {
+                    "run_id": meta["run_id"],
+                    "started_at": meta["started_at"],
+                    "completed_at": meta["completed_at"],
+                    "total_products": meta["total_products"],
+                    "sites_scraped": meta["sites_scraped"],
+                    "filters_applied": meta["filters_applied"],
+                }
+            ]
+        )
+        return {
+            "products": products_df,
+            "vendors": vendors_df,
+            "compatibility": compatibility_df,
+            "categories": categories_df,
+            "scrape_metadata": metadata_df,
+        }
+
+    @staticmethod
+    def _normalise_run_metadata(
+        data: List[Dict[str, Any]],
+        site_config: Dict[str, Any],
+        run_metadata: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        vendor_ids = sorted({str(row.get("source") or site_config.get("site_id") or "site") for row in data})
+        meta = {
+            "run_id": f"{vendor_ids[0] if vendor_ids else 'run'}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+            "started_at": now,
+            "completed_at": now,
+            "total_products": len(data),
+            "sites_scraped": ", ".join(vendor_ids),
+            "filters_applied": "",
+        }
+        if run_metadata:
+            meta.update({k: v for k, v in run_metadata.items() if v is not None})
+        meta["scraped_at"] = meta.get("completed_at", now)
+        return meta
+
+    @staticmethod
+    def _build_products_sheet(
+        data: List[Dict[str, Any]],
+        site_config: Dict[str, Any],
+        meta: Dict[str, Any],
+    ) -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        default_currency = site_config.get("currency", "EGP")
+        site_vendor_name = site_config.get("display_name") or site_config.get("site_id") or ""
+
+        for row in data:
+            vendor_id = str(row.get("source") or site_config.get("site_id") or "site")
+            product_url = str(row.get("url", ""))
+            part_number = str(row.get("part_number", "") or "")
+            oem_refs = row.get("oem_references", "")
+            if isinstance(oem_refs, list):
+                oem_refs = ", ".join(str(item) for item in oem_refs if item)
+            elif not oem_refs and part_number:
+                oem_refs = part_number
+
+            rows.append(
+                {
+                    "product_id": DataStorage._product_id(
+                        product_url,
+                        vendor_id,
+                        meta["scraped_at"],
+                    ),
+                    "part_name": row.get("name", ""),
+                    "part_number": part_number,
+                    "brand": row.get("vendor", ""),
+                    "category": row.get("category", ""),
+                    "subcategory": row.get("subcategory", ""),
+                    "price_egp": row.get("price"),
+                    "price_raw": row.get("raw_price", ""),
+                    "currency": row.get("currency") or default_currency,
+                    "vendor_name": row.get("vendor_name") or site_vendor_name or vendor_id,
+                    "vendor_id": vendor_id,
+                    "stock_status": row.get("stock_status", "unknown"),
+                    "product_url": product_url,
+                    "image_url": row.get("image_url", ""),
+                    "scraped_at": meta["scraped_at"],
+                    "description": row.get("description", ""),
+                    "specifications": json.dumps(
+                        row.get("specifications") or {},
+                        ensure_ascii=False,
+                    ),
+                    "compatibility_text": row.get("compatibility_text", ""),
+                    "oem_references": oem_refs or "",
+                    "notes": row.get("notes", ""),
+                }
+            )
+
+        columns = [
+            "product_id",
+            "part_name",
+            "part_number",
+            "brand",
+            "category",
+            "subcategory",
+            "price_egp",
+            "price_raw",
+            "currency",
+            "vendor_name",
+            "vendor_id",
+            "stock_status",
+            "product_url",
+            "image_url",
+            "scraped_at",
+            "description",
+            "specifications",
+            "compatibility_text",
+            "oem_references",
+            "notes",
+        ]
+        return pd.DataFrame(rows, columns=columns)
+
+    @staticmethod
+    def _build_vendors_sheet(
+        data: List[Dict[str, Any]],
+        site_config: Dict[str, Any],
+    ) -> pd.DataFrame:
+        vendor_ids = sorted({str(row.get("source") or site_config.get("site_id") or "site") for row in data})
+        rows = [
+            {
+                "vendor_id": vendor_id,
+                "vendor_full_name": site_config.get("display_name") or vendor_id,
+                "website_url": site_config.get("base_url", ""),
+                "platform_type": site_config.get("platform_type") or site_config.get("type", "custom"),
+                "currency": site_config.get("currency", "EGP"),
+                "shipping_notes": site_config.get("shipping_notes", ""),
+                "reliability_score": site_config.get("reliability_score"),
+            }
+            for vendor_id in vendor_ids
+        ]
+        columns = [
+            "vendor_id",
+            "vendor_full_name",
+            "website_url",
+            "platform_type",
+            "currency",
+            "shipping_notes",
+            "reliability_score",
+        ]
+        return pd.DataFrame(rows, columns=columns)
+
+    @staticmethod
+    def _build_compatibility_sheet(
+        data: List[Dict[str, Any]],
+        scraped_at: str,
+    ) -> pd.DataFrame:
+        rows: List[Dict[str, Any]] = []
+        for row in data:
+            compat = row.get("compatibility")
+            if not isinstance(compat, list):
+                continue
+            vendor_id = str(row.get("source") or "site")
+            product_id = DataStorage._product_id(
+                str(row.get("url", "")),
+                vendor_id,
+                scraped_at,
+            )
+            for index, entry in enumerate(compat, start=1):
+                if not isinstance(entry, dict):
+                    continue
+                rows.append(
+                    {
+                        "compat_id": f"{product_id}_compat_{index}",
+                        "product_id": product_id,
+                        "make": entry.get("make", ""),
+                        "model": entry.get("model", ""),
+                        "year_start": entry.get("year_start"),
+                        "year_end": entry.get("year_end"),
+                        "engine": entry.get("engine", ""),
+                        "notes": entry.get("notes", ""),
+                    }
+                )
+        columns = [
+            "compat_id",
+            "product_id",
+            "make",
+            "model",
+            "year_start",
+            "year_end",
+            "engine",
+            "notes",
+        ]
+        return pd.DataFrame(rows, columns=columns)
+
+    @staticmethod
+    def _build_categories_sheet(data: List[Dict[str, Any]]) -> pd.DataFrame:
+        categories = sorted({str(row.get("category", "")).strip() for row in data if row.get("category")})
+        rows = [
+            {
+                "category_id": sha1(name.encode("utf-8")).hexdigest()[:12],
+                "category_name": name,
+                "parent_id": "",
+            }
+            for name in categories
+        ]
+        return pd.DataFrame(rows, columns=["category_id", "category_name", "parent_id"])
+
+    @staticmethod
+    def _autosize_worksheet(worksheet: Any) -> None:
+        for col in worksheet.columns:
+            max_len = max((len(str(c.value)) for c in col if c.value is not None), default=10)
+            worksheet.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+
+    @staticmethod
+    def _product_id(product_url: str, vendor_id: str, scraped_at: str) -> str:
+        digest = sha1(f"{vendor_id}|{product_url}|{scraped_at}".encode("utf-8")).hexdigest()[:12]
+        date_tag = str(scraped_at)[:10].replace("-", "") or "run"
+        return f"{vendor_id}_{digest}_{date_tag}"
 
     @staticmethod
     def _flatten(data: List[Dict[str, Any]]) -> pd.DataFrame:
