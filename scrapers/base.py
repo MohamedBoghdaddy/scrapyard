@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from utils.metrics import MetricsTracker
 
 logger = logging.getLogger(__name__)
 
@@ -19,17 +22,24 @@ class BaseScraper(ABC):
       - scrape_product_details(product_url)
     """
 
-    def __init__(self, config: Dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        metrics: Optional["MetricsTracker"] = None,
+    ) -> None:
         self.config = config
         self.base_url: str = config.get("base_url", "")
         self.max_retries: int = config.get("max_retries", 3)
         self.timeout: int = config.get("timeout", 30)
         self.delay_min: float = config.get("request_delay_min", 1.0)
         self.delay_max: float = config.get("request_delay_max", 3.0)
+        self.max_pages: int = config.get("max_pages", 10)
+        self.llm_enabled: bool = config.get("llm_enabled", False)
+        self._metrics = metrics
         self.logger = logging.getLogger(self.__class__.__name__)
 
     # ------------------------------------------------------------------
-    # Lifecycle hooks – override in subclasses that need setup/teardown
+    # Lifecycle hooks
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "BaseScraper":
@@ -78,7 +88,7 @@ class BaseScraper(ABC):
         """
 
     # ------------------------------------------------------------------
-    # Convenience helper shared by all scrapers
+    # Convenience helpers shared by all scrapers
     # ------------------------------------------------------------------
 
     def _absolute_url(self, href: str) -> str:
