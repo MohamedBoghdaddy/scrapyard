@@ -545,6 +545,13 @@ class EgyCarPartsScraper(BaseScraper):
         """Map Shopify product JSON to the canonical schema."""
         variants = data.get("variants", [])
         first = variants[0] if variants else {}
+        product_name = (
+            data.get("title")
+            or data.get("name")
+            or first.get("name")
+            or first.get("title")
+            or str(data.get("handle", "")).replace("-", " ").strip().title()
+        )
         images = data.get("images", []) or data.get("media", [])
         image_url = ""
         if images:
@@ -562,23 +569,23 @@ class EgyCarPartsScraper(BaseScraper):
 
         return {
             "url": url,
-            "name": data.get("title", ""),
+            "name": product_name,
             "vendor": data.get("vendor", ""),
             "part_number": clean_part_number(
                 (data.get("variants") or [{}])[0].get("sku", "")
             ),
-            "price": clean_price(str(first.get("price", ""))),
+            "price": _normalise_shopify_money(first.get("price")),
             "raw_price": str(first.get("price", "")),
-            "compare_at_price": clean_price(str(first.get("compare_at_price") or "")),
+            "compare_at_price": _normalise_shopify_money(first.get("compare_at_price")),
             "image_url": image_url,
             "stock_status": "in_stock" if first.get("available") else "out_of_stock",
             "description": _strip_html(data.get("body_html", "")),
             "specifications": specs,
             "variants": [
                 {
-                    "title": variant.get("title"),
+                    "title": variant.get("title") or variant.get("name"),
                     "sku": variant.get("sku"),
-                    "price": clean_price(str(variant.get("price", ""))),
+                    "price": _normalise_shopify_money(variant.get("price")),
                     "available": variant.get("available"),
                 }
                 for variant in variants
@@ -922,6 +929,17 @@ def _strip_html(html_str: str) -> str:
     if not html_str:
         return ""
     return BeautifulSoup(html_str, "lxml").get_text(separator=" ", strip=True)
+
+
+def _normalise_shopify_money(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        numeric = float(value)
+        if numeric.is_integer() and abs(numeric) >= 1000:
+            return numeric / 100.0
+        return numeric
+    return clean_price(str(value))
 
 
 def _split_selectors(value: str) -> List[str]:
