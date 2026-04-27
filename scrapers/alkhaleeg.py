@@ -28,8 +28,14 @@ from playwright.async_api import (
 )
 
 from .base import BaseScraper
+from .detail_helpers import enrich_product_fields, extract_best_text, extract_specifications
 from .utils import clean_part_number, clean_price, get_headers, normalise_arabic, random_delay
-from utils.cleaners import first_match
+from utils.cleaners import (
+    extract_compatibility_text,
+    extract_oem_references,
+    extract_part_number,
+    first_match,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -552,9 +558,18 @@ class AlKhaleegScraper(BaseScraper):
         description = normalise_arabic(re.sub(r"\s+", " ", item.get_text(" ", strip=True)).strip())
         if description == product.get("name", ""):
             description = ""
+        compatibility_text = extract_compatibility_text(description)
+        oem_references = extract_oem_references(description)
+        listing_part_number = (
+            clean_part_number(product.get("part_number", ""))
+            or extract_part_number(description)
+        )
 
         return {
             "description": description,
+            "part_number": listing_part_number,
+            "compatibility_text": compatibility_text,
+            "oem_references": oem_references,
             "specifications": {},
             "variants": [],
             "data_source": "listing_only",
@@ -563,6 +578,10 @@ class AlKhaleegScraper(BaseScraper):
 
     def _parse_product_html(self, html: str, url: str) -> Dict[str, Any]:
         soup = BeautifulSoup(html, "lxml")
+        next_data_product = self._extract_next_data_product(soup, url)
+        if next_data_product:
+            return next_data_product
+
         jsonld_product = self._extract_jsonld_product(soup, url)
         if jsonld_product:
             return jsonld_product
@@ -573,18 +592,21 @@ class AlKhaleegScraper(BaseScraper):
                 [
                     ("h1.product-title", None),
                     ("h1", None),
-                    ('meta[property="og:title"]', "content"),
-                ],
-            )
-            or ""
+                ('meta[property="og:title"]', "content"),
+            ],
+        )
+        or ""
         )
 
+        description_selector = self.config.get("description_selector", "")
+        description_selectors = _split_selectors(description_selector)
         raw_price = first_match(
             soup,
             [
                 ("span.price", None),
                 (".product-price", None),
                 (".price", None),
+                ("[class*='price']", None),
                 ("[itemprop='price']", "content"),
                 ('meta[property="product:price:amount"]', "content"),
             ],
@@ -614,24 +636,42 @@ class AlKhaleegScraper(BaseScraper):
         description = normalise_arabic(
             first_match(
                 soup,
-                [
+                [(selector, None) for selector in description_selectors]
+                + [
                     (".product-description", None),
                     ("#product-desc", None),
                     (".description", None),
                     ("[itemprop='description']", None),
+                    ('meta[name="description"]', "content"),
+                    ('meta[property="og:description"]', "content"),
                 ],
+            )
+            or extract_best_text(
+                soup,
+                description_selectors
+                + [
+                    ".product-description",
+                    "#product-desc",
+                    ".description",
+                    "[itemprop='description']",
+                    "meta[name='description']",
+                    "meta[property='og:description']",
+                ],
+                arabic=True,
+                min_length=20,
             )
             or ""
         )
 
-        specs: Dict[str, str] = {}
-        for row in soup.select("table.specs tr, .product-specs tr, .spec-table tr, table tr"):
-            cells = row.select("td, th")
-            if len(cells) >= 2:
-                key = normalise_arabic(cells[0].get_text(" ", strip=True))
-                value = normalise_arabic(cells[1].get_text(" ", strip=True))
-                if key and value:
-                    specs[key] = value
+        specs = extract_specifications(soup, arabic=True)
+        enrichment = enrich_product_fields(
+            soup,
+            description=description,
+            vendor=vendor,
+            part_number=sku,
+            specs=specs,
+            arabic=True,
+        )
 
         image_url = first_match(
             soup,
@@ -656,17 +696,154 @@ class AlKhaleegScraper(BaseScraper):
         return {
             "url": url,
             "name": name,
-            "vendor": vendor,
-            "part_number": clean_part_number(sku),
+            "vendor": enrichment.get("vendor", vendor),
+            "part_number": enrichment.get("part_number") or clean_part_number(sku),
             "price": clean_price(raw_price),
             "raw_price": raw_price,
             "image_url": image_url,
             "stock_status": stock_status,
-            "description": description,
-            "specifications": specs,
+            "description": enrichment.get("description", description),
+            "specifications": enrichment.get("specifications", specs),
+            "compatibility_text": enrichment.get("compatibility_text", ""),
+            "oem_references": enrichment.get("oem_references", []),
             "variants": [],
             "source": self.source,
             "data_source": "playwright_html",
+        }
+
+    def _extract_next_data_product(
+        self,
+        soup: BeautifulSoup,
+        url: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Extract a product record from embedded Next.js page state."""
+        if not self.config.get("parse_next_data"):
+            return None
+
+        script = soup.select_one("#__NEXT_DATA__")
+        if not script:
+            return None
+
+        raw = script.string or script.get_text(strip=True)
+        if not raw:
+            return None
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+        queries = (
+            payload.get("props", {})
+            .get("pageProps", {})
+            .get("dehydratedState", {})
+            .get("queries", [])
+        )
+        if not isinstance(queries, list):
+            return None
+
+        parsed = urlparse(url)
+        target_id = parsed.path.rstrip("/").split("/")[-1]
+        target_int: Optional[int] = int(target_id) if target_id.isdigit() else None
+
+        candidate: Optional[Dict[str, Any]] = None
+        for query in queries:
+            data = query.get("state", {}).get("data")
+            if not isinstance(data, dict):
+                continue
+            if not data.get("name") or "price" not in data:
+                continue
+
+            query_key = str(query.get("queryKey", ""))
+            data_id = data.get("id")
+            if (
+                (target_int is not None and data_id == target_int)
+                or (target_id and f"/all-products/{target_id}" in query_key)
+            ):
+                candidate = data
+                break
+            if candidate is None:
+                candidate = data
+
+        if not candidate:
+            return None
+
+        brand = candidate.get("brand", "")
+        if isinstance(brand, dict):
+            brand = brand.get("name", "")
+
+        category = candidate.get("category", {})
+        category_name = category.get("name", "") if isinstance(category, dict) else ""
+
+        image_url = ""
+        images = candidate.get("images", [])
+        if isinstance(images, list) and images:
+            first_image = images[0] or {}
+            if isinstance(first_image, dict):
+                image_url = first_image.get("url", "")
+
+        description = normalise_arabic(str(candidate.get("description", "") or ""))
+        specs = extract_specifications(soup, arabic=True)
+        if category_name:
+            specs["Category"] = normalise_arabic(category_name)
+        manufacturer_country = candidate.get("manufacturer_country", {})
+        if isinstance(manufacturer_country, dict):
+            country_name = manufacturer_country.get("name", {})
+            if isinstance(country_name, dict):
+                specs["Made in"] = normalise_arabic(
+                    str(country_name.get("en") or country_name.get("ar") or "")
+                )
+
+        price_value = candidate.get("special_price")
+        if price_value in (None, "", 0):
+            price_value = candidate.get("price")
+        raw_price = str(price_value or "")
+
+        status = str(candidate.get("status", "")).lower()
+        stock_status = "in_stock" if status == "published" else "unknown"
+        part_number_seed = str(
+            candidate.get("sku")
+            or candidate.get("mpn")
+            or candidate.get("part_number")
+            or candidate.get("common_name", "")
+            or candidate.get("id", "")
+            or ""
+        )
+        extra_texts = [json.dumps(candidate, ensure_ascii=False, default=str)]
+        compatibility_value = candidate.get("compatibility") or candidate.get("fitment")
+        if compatibility_value:
+            extra_texts.append(str(compatibility_value))
+        oem_value = candidate.get("oem_number") or candidate.get("reference")
+        if oem_value:
+            extra_texts.append(str(oem_value))
+
+        enrichment = enrich_product_fields(
+            soup,
+            description=description,
+            vendor=normalise_arabic(str(brand or "")),
+            part_number=part_number_seed,
+            specs=specs,
+            extra_texts=extra_texts,
+            arabic=True,
+        )
+
+        return {
+            "url": url,
+            "name": normalise_arabic(str(candidate.get("name", "") or "")),
+            "vendor": enrichment.get("vendor", normalise_arabic(str(brand or ""))),
+            "part_number": enrichment.get("part_number")
+            or clean_part_number(part_number_seed),
+            "price": clean_price(raw_price),
+            "raw_price": raw_price,
+            "image_url": image_url,
+            "stock_status": stock_status,
+            "description": enrichment.get("description", description),
+            "specifications": enrichment.get("specifications", specs),
+            "compatibility_text": enrichment.get("compatibility_text", ""),
+            "oem_references": enrichment.get("oem_references", []),
+            "variants": [],
+            "source": self.source,
+            "data_source": "next_data",
         }
 
     def _seed_categories(self) -> List[Dict[str, str]]:
@@ -853,11 +1030,43 @@ class AlKhaleegScraper(BaseScraper):
                 else:
                     stock_status = "unknown"
 
+                specs = extract_specifications(soup, arabic=True)
+                additional_props = current.get("additionalProperty", [])
+                if isinstance(additional_props, dict):
+                    additional_props = [additional_props]
+                if isinstance(additional_props, list):
+                    for prop in additional_props:
+                        if not isinstance(prop, dict):
+                            continue
+                        key = normalise_arabic(
+                            str(prop.get("name") or prop.get("propertyID") or "")
+                        )
+                        value = normalise_arabic(
+                            str(prop.get("value") or prop.get("valueReference") or "")
+                        )
+                        if key and value and key not in specs:
+                            specs[key] = value
+
+                description = normalise_arabic(_strip_html(current.get("description", "")))
+                enrichment = enrich_product_fields(
+                    soup,
+                    description=description,
+                    vendor=normalise_arabic(str(brand)),
+                    part_number=str(
+                        current.get("sku")
+                        or current.get("mpn")
+                        or current.get("productID", "")
+                    ),
+                    specs=specs,
+                    arabic=True,
+                )
+
                 return {
                     "url": url,
                     "name": normalise_arabic(current.get("name", "")),
-                    "vendor": normalise_arabic(str(brand)),
-                    "part_number": clean_part_number(
+                    "vendor": enrichment.get("vendor", normalise_arabic(str(brand))),
+                    "part_number": enrichment.get("part_number")
+                    or clean_part_number(
                         current.get("sku")
                         or current.get("mpn")
                         or current.get("productID", "")
@@ -866,8 +1075,10 @@ class AlKhaleegScraper(BaseScraper):
                     "raw_price": str(offers.get("price", "")),
                     "image_url": image,
                     "stock_status": stock_status,
-                    "description": normalise_arabic(_strip_html(current.get("description", ""))),
-                    "specifications": {},
+                    "description": enrichment.get("description", description),
+                    "specifications": enrichment.get("specifications", specs),
+                    "compatibility_text": enrichment.get("compatibility_text", ""),
+                    "oem_references": enrichment.get("oem_references", []),
                     "variants": [],
                     "source": self.source,
                     "data_source": "jsonld_product",

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import sqlite3
 from hashlib import sha1
 from datetime import datetime, timezone
@@ -18,6 +20,13 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import urlparse
 
 import pandas as pd
+
+from utils.cleaners import (
+    clean_part_number,
+    generate_canonical_id,
+    normalise_arabic,
+    to_slug,
+)
 
 from db.models import (
     POSTGRES_CREATE_PRODUCTS,
@@ -28,6 +37,30 @@ from db.models import (
 logger = logging.getLogger(__name__)
 
 SyncFormat = Literal["csv", "json", "excel", "sqlite"]
+
+# ---------------------------------------------------------------------------
+# Lazy NLP import (gracefully absent when nlp package not installed)
+# ---------------------------------------------------------------------------
+
+def _try_nlp_enrich(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Run NLP pipeline on all products; return originals if nlp package unavailable."""
+    try:
+        from nlp.pipeline import enrich_batch_nlp, NLPConfig  # type: ignore
+        cfg = NLPConfig(
+            language=True,
+            keywords=True,
+            summarize=True,
+            classify=True,
+            max_keywords=8,
+            summary_sentences=2,
+        )
+        return enrich_batch_nlp(products, cfg)
+    except ImportError:
+        logger.debug("nlp package not available; skipping NLP enrichment")
+        return products
+    except Exception as exc:
+        logger.warning("NLP enrichment failed: %s", exc)
+        return products
 
 _JSON_COLS = {"specifications", "variants", "tags"}
 
@@ -46,6 +79,27 @@ PRODUCT_QA: Dict[str, Dict[str, Any]] = {
     "price": {"required": False, "type": float},
     "url":   {"required": True,  "min_length": 10},
 }
+
+_ARABIC_DIGIT_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+VEHICLE_PATTERNS = [
+    re.compile(
+        r"(?P<make>[A-Za-z]+)\s+(?P<model>[A-Za-z0-9\-]+)\s+"
+        r"(?P<year_start>\d{4})\s*[-–]\s*(?P<year_end>\d{4})"
+    ),
+    re.compile(
+        r"(?P<make_ar>[\u0621-\u064A]+)\s+(?P<model_ar>[\u0621-\u064A0-9\-]+)\s+"
+        r"(?P<year_start>\d{4})\s*[-–]\s*(?P<year_end>\d{4})"
+    ),
+    re.compile(
+        r"(?P<make>[A-Za-z]+)\s+(?P<model>[A-Za-z0-9\-]+)\s+"
+        r"(?P<year>\d{4})(?!\s*[-–]\s*\d{4})"
+    ),
+    re.compile(
+        r"(?P<make_ar>[\u0621-\u064A]+)\s+(?P<model_ar>[\u0621-\u064A0-9\-]+)\s+"
+        r"(?P<year>\d{4})(?!\s*[-–]\s*\d{4})"
+    ),
+]
 
 
 def validate_product(product: Dict[str, Any]) -> List[str]:
@@ -95,6 +149,74 @@ def partition_products(
     return valid, invalid
 
 
+async def parse_compatibility_text(
+    text: str,
+    use_llm: bool = False,
+) -> List[Dict[str, Any]]:
+    """Extract structured vehicle compatibility from raw text."""
+    if not text:
+        return []
+
+    normalised = normalise_arabic(str(text)).translate(_ARABIC_DIGIT_MAP)
+    matches: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, str, Optional[int], Optional[int], str]] = set()
+
+    for pattern in VEHICLE_PATTERNS:
+        for match in pattern.finditer(normalised):
+            groups = match.groupdict()
+            make = groups.get("make") or groups.get("make_ar") or ""
+            model = groups.get("model") or groups.get("model_ar") or ""
+            year_start = groups.get("year_start") or groups.get("year")
+            year_end = groups.get("year_end") or year_start
+            entry = {
+                "make": make.strip(),
+                "model": model.strip(),
+                "year_start": int(year_start) if year_start else None,
+                "year_end": int(year_end) if year_end else None,
+                "raw": match.group().strip(),
+            }
+            dedupe_key = (
+                entry["make"],
+                entry["model"],
+                entry["year_start"],
+                entry["year_end"],
+                entry["raw"],
+            )
+            if dedupe_key not in seen:
+                seen.add(dedupe_key)
+                matches.append(entry)
+
+    if matches or not use_llm or not os.getenv("OPENAI_API_KEY"):
+        return matches
+
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        logger.warning("OpenAI client not installed; skipping compatibility LLM fallback")
+        return matches
+
+    client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    prompt = (
+        "Extract vehicle compatibility information from the text below. "
+        "Return JSON with a top-level key 'compatibility' containing a list of "
+        "objects with keys: make, model, year_start, year_end, raw.\n\n"
+        f"Text: {text}"
+    )
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+        )
+        payload = json.loads(response.choices[0].message.content or "{}")
+        compat = payload.get("compatibility", [])
+        if isinstance(compat, list):
+            return [entry for entry in compat if isinstance(entry, dict)]
+    except Exception as exc:
+        logger.warning("Compatibility LLM fallback failed: %s", exc)
+    return matches
+
+
 # ---------------------------------------------------------------------------
 # Main storage class
 # ---------------------------------------------------------------------------
@@ -113,6 +235,118 @@ class DataStorage:
         await DataStorage.save_postgres(products, "postgresql://...")
         await DataStorage.save_mysql(products, "mysql://...")
     """
+
+    @staticmethod
+    async def enrich_products_for_export(
+        products: List[Dict[str, Any]],
+        *,
+        use_llm: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Add structured compatibility data when raw compatibility text exists."""
+        for product in products:
+            compatibility_text = product.get("compatibility_text", "")
+            if product.get("compatibility") or not compatibility_text:
+                continue
+            compatibility = await parse_compatibility_text(
+                compatibility_text,
+                use_llm=use_llm,
+            )
+            if compatibility:
+                product["compatibility"] = compatibility
+                product["compatibility_parsed"] = json.dumps(
+                    compatibility,
+                    ensure_ascii=False,
+                )
+        return products
+
+    @staticmethod
+    async def save_products_incremental(
+        products: List[Dict[str, Any]],
+        filepath: str | Path,
+        *,
+        format: SyncFormat = "excel",
+        checkpoint_mgr: Any = None,
+        site: Optional[str] = None,
+        site_config: Optional[Dict[str, Any]] = None,
+        run_metadata: Optional[Dict[str, Any]] = None,
+        use_llm: bool = False,
+    ) -> Tuple[Path, int]:
+        """
+        Save only new/changed products based on the checkpoint snapshot table.
+
+        Returns ``(output_path, changed_count)``.
+        """
+        path = Path(filepath)
+        if format not in {"csv", "json", "excel", "sqlite"}:
+            raise ValueError(
+                "Incremental export currently supports csv/json/excel/sqlite only"
+            )
+
+        vendor_id = site or (site_config or {}).get("site_id") or "site"
+        filtered: List[Dict[str, Any]] = []
+
+        for product in products:
+            product_url = str(product.get("url", ""))
+            if not product_url:
+                continue
+
+            product["vendor_id"] = product.get("vendor_id") or vendor_id
+            product["vendor_name"] = product.get("vendor_name") or (site_config or {}).get(
+                "display_name", vendor_id
+            )
+            product["currency"] = product.get("currency") or (site_config or {}).get(
+                "currency",
+                "EGP",
+            )
+            product["scraped_at"] = product.get("scraped_at") or datetime.now(
+                timezone.utc
+            ).isoformat()
+
+            if checkpoint_mgr:
+                product["product_id"] = product.get("product_id") or checkpoint_mgr._generate_product_id(
+                    vendor_id,
+                    product_url,
+                )
+                changed = await checkpoint_mgr.has_changed(
+                    product["product_id"],
+                    product.get("price"),
+                    product.get("stock_status", "unknown"),
+                )
+                if not changed:
+                    continue
+            else:
+                product["product_id"] = product.get("product_id") or DataStorage._product_id(
+                    product_url,
+                    vendor_id,
+                )
+
+            filtered.append(product)
+
+        if not filtered:
+            logger.info("No new or changed products detected for %s", vendor_id)
+            return path, 0
+
+        await DataStorage.enrich_products_for_export(filtered, use_llm=use_llm)
+
+        for product in filtered:
+            if checkpoint_mgr:
+                await checkpoint_mgr.update_snapshot(
+                    product["product_id"],
+                    vendor_id,
+                    str(product.get("url", "")),
+                    product.get("price"),
+                    product.get("stock_status", "unknown"),
+                    product,
+                )
+
+        saved_path = DataStorage.save(
+            filtered,
+            path,
+            fmt=format,
+            site_config=site_config,
+            run_metadata=run_metadata,
+        )
+        return saved_path, len(filtered)
 
     # ------------------------------------------------------------------
     # Synchronous file exports
@@ -365,10 +599,14 @@ class DataStorage:
     ) -> Dict[str, pd.DataFrame]:
         site_cfg = site_config or {}
         meta = DataStorage._normalise_run_metadata(data, site_cfg, run_metadata)
-        products_df = DataStorage._build_products_sheet(data, site_cfg, meta)
-        vendors_df = DataStorage._build_vendors_sheet(data, site_cfg)
-        compatibility_df = DataStorage._build_compatibility_sheet(data, meta["scraped_at"])
-        categories_df = DataStorage._build_categories_sheet(data)
+        # NLP enrichment — runs in-process before building sheets
+        nlp_data = _try_nlp_enrich(data)
+        products_df = DataStorage._build_products_sheet(nlp_data, site_cfg, meta)
+        aggregated_df = DataStorage.aggregate_products(products_df.copy())
+        vendors_df = DataStorage._build_vendors_sheet(nlp_data, site_cfg)
+        compatibility_df = DataStorage._build_compatibility_sheet(nlp_data, meta["scraped_at"])
+        categories_df = DataStorage._build_categories_sheet(nlp_data)
+        nlp_df = DataStorage._build_nlp_sheet(nlp_data)
         metadata_df = pd.DataFrame(
             [
                 {
@@ -383,9 +621,11 @@ class DataStorage:
         )
         return {
             "products": products_df,
+            "aggregated_prices": aggregated_df,
             "vendors": vendors_df,
             "compatibility": compatibility_df,
             "categories": categories_df,
+            "nlp_enrichment": nlp_df,
             "scrape_metadata": metadata_df,
         }
 
@@ -396,7 +636,17 @@ class DataStorage:
         run_metadata: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         now = datetime.now(timezone.utc).isoformat()
-        vendor_ids = sorted({str(row.get("source") or site_config.get("site_id") or "site") for row in data})
+        vendor_ids = sorted(
+            {
+                str(
+                    row.get("vendor_id")
+                    or row.get("source")
+                    or site_config.get("site_id")
+                    or "site"
+                )
+                for row in data
+            }
+        )
         meta = {
             "run_id": f"{vendor_ids[0] if vendor_ids else 'run'}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
             "started_at": now,
@@ -421,7 +671,12 @@ class DataStorage:
         site_vendor_name = site_config.get("display_name") or site_config.get("site_id") or ""
 
         for row in data:
-            vendor_id = str(row.get("source") or site_config.get("site_id") or "site")
+            vendor_id = str(
+                row.get("vendor_id")
+                or row.get("source")
+                or site_config.get("site_id")
+                or "site"
+            )
             product_url = str(row.get("url", ""))
             part_number = str(row.get("part_number", "") or "")
             oem_refs = row.get("oem_references", "")
@@ -432,11 +687,8 @@ class DataStorage:
 
             rows.append(
                 {
-                    "product_id": DataStorage._product_id(
-                        product_url,
-                        vendor_id,
-                        meta["scraped_at"],
-                    ),
+                    "product_id": row.get("product_id")
+                    or DataStorage._product_id(product_url, vendor_id),
                     "part_name": row.get("name", ""),
                     "part_number": part_number,
                     "brand": row.get("vendor", ""),
@@ -450,7 +702,7 @@ class DataStorage:
                     "stock_status": row.get("stock_status", "unknown"),
                     "product_url": product_url,
                     "image_url": row.get("image_url", ""),
-                    "scraped_at": meta["scraped_at"],
+                    "scraped_at": row.get("scraped_at") or meta["scraped_at"],
                     "description": row.get("description", ""),
                     "specifications": json.dumps(
                         row.get("specifications") or {},
@@ -459,6 +711,11 @@ class DataStorage:
                     "compatibility_text": row.get("compatibility_text", ""),
                     "oem_references": oem_refs or "",
                     "notes": row.get("notes", ""),
+                    # NLP-enriched fields
+                    "language": row.get("language", ""),
+                    "topic_category": row.get("topic_category", ""),
+                    "keywords": row.get("keywords", ""),
+                    "ai_summary": row.get("ai_summary", ""),
                 }
             )
 
@@ -483,7 +740,79 @@ class DataStorage:
             "compatibility_text",
             "oem_references",
             "notes",
+            "language",
+            "topic_category",
+            "keywords",
+            "ai_summary",
         ]
+        return pd.DataFrame(rows, columns=columns)
+
+    @staticmethod
+    def aggregate_products(df: pd.DataFrame) -> pd.DataFrame:
+        """Group products by a normalized identifier and compute price stats."""
+        columns = [
+            "canonical_id",
+            "part_number",
+            "part_name",
+            "category",
+            "avg_price_egp",
+            "min_price_egp",
+            "max_price_egp",
+            "vendor_count",
+            "vendors",
+            "vendor_prices",
+            "last_updated",
+        ]
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+
+        working = df.copy()
+        working["_part_number_clean"] = working["part_number"].fillna("").map(clean_part_number)
+        working["_name_key"] = working["part_name"].fillna("").map(
+            lambda value: to_slug(normalise_arabic(str(value)))[:120]
+        )
+        working["_match_key"] = working.apply(
+            lambda row: row["_part_number_clean"] or row["_name_key"],
+            axis=1,
+        )
+        working = working[working["_match_key"].astype(str) != ""]
+        if working.empty:
+            return pd.DataFrame(columns=columns)
+
+        working["_canonical_id"] = working.apply(
+            lambda row: generate_canonical_id(row["_match_key"], row.get("category", "")),
+            axis=1,
+        )
+
+        rows: List[Dict[str, Any]] = []
+        for canonical_id, group in working.groupby("_canonical_id"):
+            prices = pd.to_numeric(group["price_egp"], errors="coerce").dropna()
+            vendors = sorted(str(v) for v in group["vendor_id"].dropna().astype(str).unique() if v)
+            vendor_prices: Dict[str, float] = {}
+            for _, entry in group.iterrows():
+                vendor = str(entry.get("vendor_id") or "").strip()
+                price = entry.get("price_egp")
+                if vendor and pd.notna(price):
+                    vendor_prices[vendor] = float(price)
+
+            part_name_mode = group["part_name"].mode()
+            category_mode = group["category"].mode()
+            cleaned_part_numbers = [value for value in group["_part_number_clean"] if value]
+            rows.append(
+                {
+                    "canonical_id": canonical_id,
+                    "part_number": cleaned_part_numbers[0] if cleaned_part_numbers else "",
+                    "part_name": part_name_mode.iloc[0] if not part_name_mode.empty else group["part_name"].iloc[0],
+                    "category": category_mode.iloc[0] if not category_mode.empty else group["category"].iloc[0],
+                    "avg_price_egp": float(prices.mean()) if not prices.empty else None,
+                    "min_price_egp": float(prices.min()) if not prices.empty else None,
+                    "max_price_egp": float(prices.max()) if not prices.empty else None,
+                    "vendor_count": len(vendors),
+                    "vendors": ", ".join(vendors),
+                    "vendor_prices": json.dumps(vendor_prices, ensure_ascii=False),
+                    "last_updated": group["scraped_at"].max(),
+                }
+            )
         return pd.DataFrame(rows, columns=columns)
 
     @staticmethod
@@ -491,19 +820,34 @@ class DataStorage:
         data: List[Dict[str, Any]],
         site_config: Dict[str, Any],
     ) -> pd.DataFrame:
-        vendor_ids = sorted({str(row.get("source") or site_config.get("site_id") or "site") for row in data})
-        rows = [
-            {
-                "vendor_id": vendor_id,
-                "vendor_full_name": site_config.get("display_name") or vendor_id,
-                "website_url": site_config.get("base_url", ""),
-                "platform_type": site_config.get("platform_type") or site_config.get("type", "custom"),
-                "currency": site_config.get("currency", "EGP"),
-                "shipping_notes": site_config.get("shipping_notes", ""),
-                "reliability_score": site_config.get("reliability_score"),
-            }
-            for vendor_id in vendor_ids
-        ]
+        vendor_rows: Dict[str, Dict[str, Any]] = {}
+        for row in data:
+            vendor_id = str(
+                row.get("vendor_id")
+                or row.get("source")
+                or site_config.get("site_id")
+                or "site"
+            )
+            vendor_rows.setdefault(
+                vendor_id,
+                {
+                    "vendor_id": vendor_id,
+                    "vendor_full_name": row.get("vendor_name")
+                    or site_config.get("display_name")
+                    or vendor_id,
+                    "website_url": row.get("site_url") or site_config.get("base_url", ""),
+                    "platform_type": row.get("platform_type")
+                    or site_config.get("platform_type")
+                    or site_config.get("type", "custom"),
+                    "currency": row.get("currency") or site_config.get("currency", "EGP"),
+                    "shipping_notes": row.get("shipping_notes")
+                    or site_config.get("shipping_notes", ""),
+                    "reliability_score": row.get("reliability_score")
+                    if row.get("reliability_score") is not None
+                    else site_config.get("reliability_score"),
+                },
+            )
+        rows = [vendor_rows[key] for key in sorted(vendor_rows)]
         columns = [
             "vendor_id",
             "vendor_full_name",
@@ -523,13 +867,17 @@ class DataStorage:
         rows: List[Dict[str, Any]] = []
         for row in data:
             compat = row.get("compatibility")
+            if not compat and row.get("compatibility_parsed"):
+                try:
+                    compat = json.loads(row["compatibility_parsed"])
+                except (TypeError, json.JSONDecodeError):
+                    compat = []
             if not isinstance(compat, list):
                 continue
-            vendor_id = str(row.get("source") or "site")
-            product_id = DataStorage._product_id(
+            vendor_id = str(row.get("vendor_id") or row.get("source") or "site")
+            product_id = row.get("product_id") or DataStorage._product_id(
                 str(row.get("url", "")),
                 vendor_id,
-                scraped_at,
             )
             for index, entry in enumerate(compat, start=1):
                 if not isinstance(entry, dict):
@@ -572,16 +920,43 @@ class DataStorage:
         return pd.DataFrame(rows, columns=["category_id", "category_name", "parent_id"])
 
     @staticmethod
+    def _build_nlp_sheet(data: List[Dict[str, Any]]) -> pd.DataFrame:
+        """Build a dedicated NLP enrichment sheet for the Excel workbook."""
+        columns = [
+            "product_id",
+            "part_name",
+            "language",
+            "topic_category",
+            "keywords",
+            "ai_summary",
+        ]
+        rows: List[Dict[str, Any]] = []
+        for row in data:
+            product_url = str(row.get("url", ""))
+            vendor_id = str(row.get("vendor_id") or row.get("source") or "site")
+            rows.append(
+                {
+                    "product_id": row.get("product_id")
+                    or DataStorage._product_id(product_url, vendor_id),
+                    "part_name": row.get("name", ""),
+                    "language": row.get("language", ""),
+                    "topic_category": row.get("topic_category", ""),
+                    "keywords": row.get("keywords", ""),
+                    "ai_summary": row.get("ai_summary", ""),
+                }
+            )
+        return pd.DataFrame(rows, columns=columns)
+
+    @staticmethod
     def _autosize_worksheet(worksheet: Any) -> None:
         for col in worksheet.columns:
             max_len = max((len(str(c.value)) for c in col if c.value is not None), default=10)
             worksheet.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
 
     @staticmethod
-    def _product_id(product_url: str, vendor_id: str, scraped_at: str) -> str:
-        digest = sha1(f"{vendor_id}|{product_url}|{scraped_at}".encode("utf-8")).hexdigest()[:12]
-        date_tag = str(scraped_at)[:10].replace("-", "") or "run"
-        return f"{vendor_id}_{digest}_{date_tag}"
+    def _product_id(product_url: str, vendor_id: str) -> str:
+        digest = sha1(f"{vendor_id}|{product_url}".encode("utf-8")).hexdigest()[:16]
+        return f"{vendor_id}_{digest}"
 
     @staticmethod
     def _flatten(data: List[Dict[str, Any]]) -> pd.DataFrame:

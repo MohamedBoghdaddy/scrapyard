@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 from tqdm.asyncio import tqdm
 
+from scrapers.detail_helpers import merge_product_payloads
 from scrapers import get_scraper
 from utils.metrics import MetricsCollector
 from utils.storage import DataStorage
@@ -39,6 +41,11 @@ LOG_DIR.mkdir(exist_ok=True)
 
 
 def _configure_logging(level: str = "INFO") -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     handlers: list[logging.Handler] = [
@@ -57,18 +64,60 @@ def _configure_logging(level: str = "INFO") -> None:
 
 logger = logging.getLogger("scrapyard")
 
+DEFAULT_SITE_SELECTOR = "all"
+DEFAULT_MAX_PAGES = 200
+
+_OUTPUT_SUFFIX_FORMATS = {
+    ".csv": "csv",
+    ".json": "json",
+    ".xlsx": "excel",
+    ".db": "sqlite",
+}
+
+
+class SiteRunError(RuntimeError):
+    """Raised when a single site run fails in a recoverable way."""
+
+
+def _product_has_price(product: Dict[str, Any]) -> bool:
+    """Return True when a scraped row already contains a usable numeric price."""
+    price = product.get("price")
+    if price is None:
+        return False
+    if isinstance(price, str):
+        return price.strip() != ""
+    return price == price
+
+
+def _needs_price_backfill(product: Dict[str, Any]) -> bool:
+    """Backfill only rows that are missing both parsed and raw price values."""
+    if _product_has_price(product):
+        return False
+    raw_price = str(product.get("raw_price", "") or "").strip()
+    if raw_price:
+        return False
+    product_url = str(product.get("url", "") or "")
+    if not product_url or "#material-" in product_url:
+        return False
+    if product.get("listing_only"):
+        return False
+    return True
+
 # ---------------------------------------------------------------------------
 # Core async logic
 # ---------------------------------------------------------------------------
 
 
-async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
+async def run(
+    args: argparse.Namespace,
+    site_config: Dict[str, Any],
+) -> Dict[str, Any]:
     # ── Infrastructure ────────────────────────────────────────────────────
     metrics = MetricsCollector(site=args.site)
     notifier = SlackNotifier()  # reads SLACK_WEBHOOK_URL from env; no-ops if absent
 
     checkpoint: Optional[CheckpointManager] = None
-    if args.resume:
+    if args.resume or args.incremental:
         checkpoint = CheckpointManager(db_url="scraper_state.db")
         await checkpoint.setup()
         logger.info("Checkpoint manager ready (resume mode)")
@@ -103,7 +152,9 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
                 args.site,
                 "No categories found – verify base_url and CSS selectors.",
             )
-            sys.exit(2)
+            raise SiteRunError(
+                f"No categories found for '{args.site}' - verify config selectors."
+            )
 
         logger.info("Found %d categories", len(categories))
         await notifier.notify_start(args.site, len(categories))
@@ -117,7 +168,13 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
                 cat_name = cat["name"]
 
                 # Resume: skip already-finished categories
-                if checkpoint and await checkpoint.is_scraped(cat_url):
+                if (
+                    checkpoint
+                    and args.resume
+                    and not args.incremental
+                    and not args.force
+                    and await checkpoint.is_scraped(cat_url)
+                ):
                     logger.info("Skipping (already scraped): %s", cat_name)
                     metrics.record_checkpoint_resume()
                     return []
@@ -156,7 +213,14 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
 
         # Gather all categories with live progress bar
         tasks = [_scrape_category(cat) for cat in categories]
-        results = await tqdm.gather(*tasks, desc="Categories", unit="cat")
+        if getattr(args, "show_progress", True):
+            results = await tqdm.gather(
+                *tasks,
+                desc=f"{args.site}: Categories",
+                unit="cat",
+            )
+        else:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for result in results:
             if isinstance(result, list):
@@ -176,12 +240,43 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
             )
 
         # ── Optional: detail pages ─────────────────────────────────────
-        if args.details and all_products:
-            logger.info("Fetching %d product detail pages …", len(all_products))
+        should_fetch_details = args.details or bool(site_config.get("auto_details"))
+        should_backfill_missing_prices = bool(
+            site_config.get("backfill_missing_prices", True)
+        )
+        missing_price_indexes = [
+            index
+            for index, product in enumerate(all_products)
+            if _needs_price_backfill(product)
+        ]
+        target_indexes = (
+            list(range(len(all_products)))
+            if should_fetch_details
+            else missing_price_indexes if should_backfill_missing_prices else []
+        )
+        if target_indexes and all_products:
+            if should_fetch_details:
+                logger.info("Fetching %d product detail pages …", len(target_indexes))
+            else:
+                logger.info(
+                    "Backfilling missing prices from %d product detail pages …",
+                    len(target_indexes),
+                )
 
-            async def _scrape_detail(product: Dict[str, Any]) -> Dict[str, Any]:
+            async def _scrape_detail(
+                product: Dict[str, Any],
+                *,
+                force_fetch: bool = False,
+            ) -> Dict[str, Any]:
                 async with sem:
-                    if checkpoint and await checkpoint.is_scraped(product["url"]):
+                    if (
+                        checkpoint
+                        and not force_fetch
+                        and args.resume
+                        and not args.incremental
+                        and not args.force
+                        and await checkpoint.is_scraped(product["url"])
+                    ):
                         metrics.record_checkpoint_resume()
                         return product
                     try:
@@ -191,22 +286,67 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
                             await checkpoint.mark_scraped(
                                 product["url"], site=args.site
                             )
-                        return {**product, **detail}
+                        return merge_product_payloads(product, detail)
                     except Exception as exc:
                         logger.warning(
                             "Detail fetch failed for %s: %s", product["url"], exc
                         )
                         return product
 
-            detail_tasks = [_scrape_detail(p) for p in all_products]
-            enriched = await tqdm.gather(
-                *detail_tasks, desc="Details", unit="prod"
-            )
-            all_products = [r for r in enriched if isinstance(r, dict)]
+            detail_tasks = [
+                _scrape_detail(
+                    all_products[index],
+                    force_fetch=not should_fetch_details,
+                )
+                for index in target_indexes
+            ]
+            if getattr(args, "show_progress", True):
+                enriched = await tqdm.gather(
+                    *detail_tasks,
+                    desc=(
+                        f"{args.site}: Details"
+                        if should_fetch_details
+                        else f"{args.site}: Price Backfill"
+                    ),
+                    unit="prod",
+                )
+            else:
+                enriched = await asyncio.gather(
+                    *detail_tasks,
+                    return_exceptions=True,
+                )
+            for index, result in zip(target_indexes, enriched):
+                if isinstance(result, dict):
+                    all_products[index] = result
 
     # ── Save results ──────────────────────────────────────────────────────
     summary = metrics.finish()
     run_metadata = _build_run_metadata(args, site_config, summary)
+
+    scraped_at = datetime.now(timezone.utc).isoformat()
+    for product in all_products:
+        product["vendor_id"] = product.get("vendor_id") or args.site
+        product["vendor_name"] = product.get("vendor_name") or site_config.get(
+            "display_name",
+            args.site,
+        )
+        product["site_url"] = product.get("site_url") or site_config.get("base_url", "")
+        product["platform_type"] = product.get("platform_type") or site_config.get(
+            "platform_type",
+            site_config.get("type", "custom"),
+        )
+        product["currency"] = product.get("currency") or site_config.get("currency", "EGP")
+        product["scraped_at"] = product.get("scraped_at") or scraped_at
+        if checkpoint:
+            product["product_id"] = product.get("product_id") or checkpoint._generate_product_id(
+                args.site,
+                str(product.get("url", "")),
+            )
+        else:
+            product["product_id"] = product.get("product_id") or DataStorage._product_id(
+                str(product.get("url", "")),
+                args.site,
+            )
 
     if not all_products:
         logger.warning("No products to save")
@@ -214,20 +354,118 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
         await notifier.notify_complete(args.site, summary)
         if checkpoint:
             await checkpoint.close()
-        return
+        return {
+            "status": "success",
+            "site": args.site,
+            "saved_count": 0,
+            "total_products": 0,
+            "output_path": None,
+            "summary": summary,
+            "products": [],
+        }
 
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / args.site
+    if getattr(args, "defer_save", False):
+        export_products = all_products
 
-    if args.format in ("postgres", "mysql"):
+        if args.incremental and checkpoint:
+            changed_products: List[Dict[str, Any]] = []
+            for product in all_products:
+                changed = await checkpoint.has_changed(
+                    str(product.get("product_id", "")),
+                    product.get("price"),
+                    str(product.get("stock_status", "unknown")),
+                )
+                if changed:
+                    changed_products.append(product)
+            export_products = changed_products
+
+        if export_products:
+            await DataStorage.enrich_products_for_export(
+                export_products,
+                use_llm=args.llm,
+            )
+
+            if args.incremental and checkpoint:
+                for product in export_products:
+                    await checkpoint.update_snapshot(
+                        str(product.get("product_id", "")),
+                        args.site,
+                        str(product.get("url", "")),
+                        product.get("price"),
+                        str(product.get("stock_status", "unknown")),
+                        product,
+                    )
+        else:
+            logger.info("No new or changed products detected for %s", args.site)
+
+        metrics_path = _write_metrics(args.site, metrics)
+        logger.info("Run metadata saved to %s", metrics_path)
+
+        await notifier.notify_complete(args.site, summary)
+
+        if checkpoint:
+            await checkpoint.close()
+
+        return {
+            "status": "success",
+            "site": args.site,
+            "saved_count": len(export_products),
+            "total_products": int(summary.get("total_products", 0)),
+            "output_path": None,
+            "summary": summary,
+            "products": export_products,
+        }
+
+    output_path = _resolve_output_path(
+        args.output,
+        args.site,
+        multi_site=getattr(args, "multi_site", False),
+    )
+    saved_path: Optional[Path] = None
+    saved_count = len(all_products)
+
+    if not args.incremental or args.format in ("postgres", "mysql"):
+        await DataStorage.enrich_products_for_export(
+            all_products,
+            use_llm=args.llm,
+        )
+
+    if args.incremental and args.format in ("postgres", "mysql"):
+        logger.warning(
+            "Incremental mode is not supported for %s export yet; falling back to full export",
+            args.format,
+        )
+
+    if args.incremental and args.format not in ("postgres", "mysql"):
+        saved_path, changed_count = await DataStorage.save_products_incremental(
+            all_products,
+            output_path,
+            format=args.format,
+            checkpoint_mgr=checkpoint,
+            site=args.site,
+            site_config=site_config,
+            run_metadata=run_metadata,
+            use_llm=args.llm,
+        )
+        if changed_count == 0:
+            logger.info("No new or changed products detected for %s", args.site)
+            print(f"\nDone. No new or changed products for: {args.site}")
+        else:
+            logger.info(
+                "Saved %d new/changed products to %s",
+                changed_count,
+                saved_path,
+            )
+            print(
+                f"\nDone. {changed_count} new/changed products saved to: {saved_path}"
+            )
+        saved_count = changed_count
+    elif args.format in ("postgres", "mysql"):
         db_url = os.environ.get("DATABASE_URL", "")
         if not db_url:
-            logger.error(
-                "DATABASE_URL environment variable is required for --format %s",
-                args.format,
+            raise SiteRunError(
+                f"DATABASE_URL environment variable is required for --format {args.format}"
             )
-            sys.exit(1)
         if args.format == "postgres":
             saved = await DataStorage.save_postgres(all_products, db_url)
             logger.info("PostgreSQL: %d rows upserted", saved)
@@ -242,6 +480,7 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
             site_config=site_config,
             run_metadata=run_metadata,
         )
+        saved_count = saved
     else:
         saved_path = DataStorage.save(
             all_products,
@@ -252,6 +491,7 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
         )
         logger.info("Results saved to %s", saved_path)
         print(f"\nDone. {len(all_products)} products saved to: {saved_path}")
+        saved_count = len(all_products)
 
     # ── Metrics + notifications ───────────────────────────────────────────
     metrics_path = _write_metrics(args.site, metrics)
@@ -263,6 +503,15 @@ async def run(args: argparse.Namespace, site_config: Dict[str, Any]) -> None:
         await checkpoint.close()
 
     _print_summary(summary)
+    return {
+        "status": "success",
+        "site": args.site,
+        "saved_count": saved_count,
+        "total_products": int(summary.get("total_products", 0)),
+        "output_path": str(saved_path) if saved_path else None,
+        "summary": summary,
+        "products": [],
+    }
 
 
 def _write_metrics(site: str, metrics: MetricsCollector) -> Path:
@@ -288,6 +537,8 @@ def _build_run_metadata(
         "concurrency": args.concurrency,
         "details": args.details,
         "llm": args.llm,
+        "incremental": args.incremental,
+        "force": args.force,
         "max_pages": args.max_pages or site_config.get("max_pages", 0),
         "ignore_ssl": args.ignore_ssl,
     }
@@ -297,6 +548,187 @@ def _build_run_metadata(
         "completed_at": completed_at.isoformat(),
         "total_products": int(summary.get("total_products", 0)),
         "sites_scraped": args.site,
+        "filters_applied": json.dumps(filters, ensure_ascii=False),
+    }
+
+
+def _resolve_output_path(
+    output_arg: str,
+    site: str,
+    *,
+    multi_site: bool = False,
+) -> Path:
+    """Treat --output as either a directory or a concrete file path."""
+    raw_path = Path(output_arg)
+    if raw_path.suffix.lower() in _OUTPUT_SUFFIX_FORMATS:
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        if multi_site:
+            target_dir = raw_path.parent / raw_path.stem
+            target_dir.mkdir(parents=True, exist_ok=True)
+            return target_dir / site
+        return raw_path.with_suffix("")
+
+    raw_path.mkdir(parents=True, exist_ok=True)
+    return raw_path / site
+
+
+def _resolve_combined_output_path(output_arg: str) -> Path:
+    """Resolve the export target for a combined multi-site workbook/file."""
+    raw_path = Path(output_arg)
+    if raw_path.suffix.lower() in _OUTPUT_SUFFIX_FORMATS:
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        return raw_path.with_suffix("")
+
+    raw_path.mkdir(parents=True, exist_ok=True)
+    return raw_path / "all_sites"
+
+
+def _resolve_output_format(args: argparse.Namespace) -> str:
+    """Infer export format from args and output path."""
+    explicit = args.format
+    inferred = _OUTPUT_SUFFIX_FORMATS.get(Path(args.output).suffix.lower())
+    if explicit:
+        if inferred and inferred != explicit:
+            logger.warning(
+                "Output suffix '%s' does not match --format '%s'; using the explicit format",
+                Path(args.output).suffix,
+                explicit,
+            )
+        return explicit
+    return inferred or "excel"
+
+
+def _canonical_site_ids(all_configs: Dict[str, Any]) -> List[str]:
+    """Return canonical site ids, skipping alias duplicates."""
+    seen: set[tuple[str, str, str]] = set()
+    site_ids: List[str] = []
+    for site_id, config in all_configs.items():
+        key = (
+            str(config.get("base_url", "")).rstrip("/"),
+            str(config.get("engine", "")),
+            str(config.get("display_name", site_id)),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        site_ids.append(site_id)
+    return site_ids
+
+
+def _resolve_site_ids(requested_site: str, all_configs: Dict[str, Any]) -> List[str]:
+    """Resolve the requested site selector into concrete site ids."""
+    if requested_site.lower() == "all":
+        return _canonical_site_ids(all_configs)
+    if requested_site in all_configs:
+        return [requested_site]
+    return []
+
+
+async def _run_many_sites(
+    args: argparse.Namespace,
+    all_configs: Dict[str, Any],
+    site_ids: List[str],
+) -> List[Dict[str, Any]]:
+    """Run multiple sites concurrently."""
+    limit = args.site_concurrency or len(site_ids)
+    limit = max(1, limit)
+    logger.info(
+        "Running %d sites concurrently (limit=%d): %s",
+        len(site_ids),
+        limit,
+        ", ".join(site_ids),
+    )
+    semaphore = asyncio.Semaphore(limit)
+
+    async def _run_one(site_id: str) -> Dict[str, Any]:
+        async with semaphore:
+            site_args = argparse.Namespace(**vars(args))
+            site_args.site = site_id
+            site_args.multi_site = True
+            site_args.show_progress = False
+            site_config = copy.deepcopy(all_configs[site_id])
+            site_config["ignore_ssl"] = args.ignore_ssl
+
+            base_url = site_config.get("base_url", "")
+            if not base_url or "example" in str(base_url).lower():
+                logger.warning(
+                    "base_url for '%s' looks like a placeholder ('%s').",
+                    site_id,
+                    base_url,
+                )
+
+            logger.info("Starting site: %s", site_id)
+            try:
+                result = await run(site_args, site_config)
+            except Exception as exc:
+                logger.exception("Site '%s' failed", site_id)
+                return {
+                    "status": "failed",
+                    "site": site_id,
+                    "saved_count": 0,
+                    "total_products": 0,
+                    "output_path": None,
+                    "error": str(exc),
+                }
+
+            logger.info("Completed site: %s", site_id)
+            return result
+
+    tasks = [asyncio.create_task(_run_one(site_id)) for site_id in site_ids]
+    return await asyncio.gather(*tasks)
+
+
+def _print_multi_site_summary(results: List[Dict[str, Any]]) -> None:
+    print("\n-- Multi-Site Summary -----------------------")
+    success_count = 0
+    failure_count = 0
+    total_saved = 0
+
+    for result in results:
+        site = result.get("site", "?")
+        status = result.get("status", "failed")
+        if status == "success":
+            success_count += 1
+            saved = int(result.get("saved_count", 0) or 0)
+            total_saved += saved
+            print(f"  {site:<16} OK     saved={saved}")
+        else:
+            failure_count += 1
+            error = result.get("error", "unknown error")
+            print(f"  {site:<16} FAILED {error}")
+
+    print("---------------------------------------------")
+    print(f"  Sites succeeded : {success_count}")
+    print(f"  Sites failed    : {failure_count}")
+    print(f"  Total saved     : {total_saved}")
+    print("---------------------------------------------")
+
+
+def _build_combined_run_metadata(
+    args: argparse.Namespace,
+    products: List[Dict[str, Any]],
+    site_ids: List[str],
+) -> Dict[str, Any]:
+    completed_at = datetime.now(timezone.utc)
+    filters = {
+        "site": "all",
+        "format": args.format,
+        "resume": args.resume,
+        "concurrency": args.concurrency,
+        "site_concurrency": args.site_concurrency,
+        "details": args.details,
+        "llm": args.llm,
+        "incremental": args.incremental,
+        "force": args.force,
+        "max_pages": args.max_pages,
+        "ignore_ssl": args.ignore_ssl,
+    }
+    return {
+        "run_id": f"all_sites_{completed_at.strftime('%Y%m%dT%H%M%SZ')}",
+        "started_at": completed_at.isoformat(),
+        "completed_at": completed_at.isoformat(),
+        "total_products": len(products),
+        "sites_scraped": ", ".join(sorted(site_ids)),
         "filters_applied": json.dumps(filters, ensure_ascii=False),
     }
 
@@ -330,8 +762,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--site",
-        required=True,
-        help="Target site identifier from config/sites.yaml",
+        default=DEFAULT_SITE_SELECTOR,
+        help="Target site identifier from config/sites.yaml, or 'all' to scrape every canonical site concurrently",
     )
     parser.add_argument(
         "--config",
@@ -345,9 +777,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--format",
-        default="json",
+        default=None,
         choices=["csv", "json", "excel", "sqlite", "postgres", "mysql"],
-        help="Export format",
+        help="Export format. If omitted, the format is inferred from --output or defaults to excel",
     )
     parser.add_argument(
         "--resume",
@@ -355,10 +787,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resume a previous run – skip categories/products already scraped",
     )
     parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Export only products whose price or stock status changed",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Ignore checkpoint skip logic and re-scrape categories",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=5,
         help="Maximum number of concurrent category or detail-page fetches",
+    )
+    parser.add_argument(
+        "--site-concurrency",
+        type=int,
+        default=0,
+        help="Maximum number of concurrent site runs when --site all (0 = run all selected sites in parallel)",
     )
     parser.add_argument(
         "--details",
@@ -373,9 +821,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-pages",
         type=int,
-        default=0,
+        default=DEFAULT_MAX_PAGES,
         metavar="N",
-        help="Override config max_pages (0 = use config value)",
+        help="Maximum pages to scrape per site by default (pass 0 to use the per-site config value)",
     )
     parser.add_argument(
         "--ignore-ssl",
@@ -410,34 +858,96 @@ def main() -> None:
     with open(config_path, encoding="utf-8") as fh:
         all_configs: Dict[str, Any] = yaml.safe_load(fh)
 
-    if args.site not in all_configs:
+    args.format = _resolve_output_format(args)
+    selected_sites = _resolve_site_ids(args.site, all_configs)
+
+    if not selected_sites:
         logger.error(
             "Site '%s' not found in %s. Available: %s",
             args.site, config_path, list(all_configs),
         )
         sys.exit(1)
 
-    site_config = all_configs[args.site]
-
-    # Validate base_url
-    base_url = site_config.get("base_url", "")
-    if not base_url or "example" in base_url.lower():
-        logger.warning(
-            "base_url for '%s' looks like a placeholder ('%s'). "
-            "Update config/sites.yaml before scraping.",
-            args.site, base_url,
+    logger.info("Using export format: %s", args.format)
+    if args.site.lower() == DEFAULT_SITE_SELECTOR:
+        logger.info(
+            "Running all %d canonical sites: %s",
+            len(selected_sites),
+            ", ".join(selected_sites),
         )
 
-    # Propagate SSL flag into config for aiohttp scrapers
-    site_config["ignore_ssl"] = args.ignore_ssl
-
-    Path(args.output).mkdir(parents=True, exist_ok=True)
-
     try:
-        asyncio.run(run(args, site_config))
+        if len(selected_sites) == 1:
+            args.site = selected_sites[0]
+            args.multi_site = False
+            args.show_progress = True
+            site_config = copy.deepcopy(all_configs[args.site])
+
+            # Validate base_url
+            base_url = site_config.get("base_url", "")
+            if not base_url or "example" in str(base_url).lower():
+                logger.warning(
+                    "base_url for '%s' looks like a placeholder ('%s'). "
+                    "Update config/sites.yaml before scraping.",
+                    args.site, base_url,
+                )
+
+            # Propagate SSL flag into config for aiohttp scrapers
+            site_config["ignore_ssl"] = args.ignore_ssl
+            asyncio.run(run(args, site_config))
+        else:
+            args.multi_site = True
+            args.show_progress = False
+            args.defer_save = args.format in ("csv", "json", "excel", "sqlite")
+            results = asyncio.run(_run_many_sites(args, all_configs, selected_sites))
+            combined_output_path: Optional[Path] = None
+
+            if args.defer_save:
+                combined_products: List[Dict[str, Any]] = []
+                successful_sites: List[str] = []
+                for result in results:
+                    if result.get("status") != "success":
+                        continue
+                    successful_sites.append(str(result.get("site", "")))
+                    combined_products.extend(result.get("products", []))
+
+                if combined_products:
+                    combined_output_path = DataStorage.save(
+                        combined_products,
+                        _resolve_combined_output_path(args.output),
+                        fmt=args.format,
+                        site_config={
+                            "site_id": "all_sites",
+                            "display_name": "All Sites",
+                            "currency": "EGP",
+                        },
+                        run_metadata=_build_combined_run_metadata(
+                            args,
+                            combined_products,
+                            successful_sites,
+                        ),
+                    )
+                    saved_file = combined_output_path.with_suffix(
+                        ".xlsx" if args.format == "excel" else f".{args.format}"
+                    )
+                    logger.info(
+                        "Combined %s export saved to %s",
+                        args.format,
+                        saved_file,
+                    )
+                    print(f"\nCombined export saved to: {saved_file}")
+                else:
+                    logger.info("No products available to write for the combined export")
+
+            _print_multi_site_summary(results)
+            if any(result.get("status") != "success" for result in results):
+                sys.exit(1)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
         sys.exit(0)
+    except SiteRunError as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

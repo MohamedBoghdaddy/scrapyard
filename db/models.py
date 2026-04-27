@@ -30,6 +30,18 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 """
 
+SQLITE_CREATE_PRODUCT_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS product_snapshots (
+    product_id    TEXT PRIMARY KEY,
+    site          TEXT NOT NULL DEFAULT '',
+    product_url   TEXT NOT NULL DEFAULT '',
+    price         REAL,
+    stock_status  TEXT,
+    last_seen     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    raw_data      TEXT
+);
+"""
+
 SQLITE_CREATE_PRODUCTS = """
 CREATE TABLE IF NOT EXISTS products (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,6 +65,7 @@ CREATE TABLE IF NOT EXISTS products (
 SQLITE_ALL_DDL = [
     SQLITE_CREATE_SCRAPED_URLS,
     SQLITE_CREATE_CHECKPOINTS,
+    SQLITE_CREATE_PRODUCT_SNAPSHOTS,
     SQLITE_CREATE_PRODUCTS,
 ]
 
@@ -83,6 +96,18 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 """
 
+POSTGRES_CREATE_PRODUCT_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS product_snapshots (
+    product_id    TEXT PRIMARY KEY,
+    site          TEXT NOT NULL DEFAULT '',
+    product_url   TEXT NOT NULL DEFAULT '',
+    price         NUMERIC(12, 2),
+    stock_status  TEXT,
+    last_seen     TIMESTAMPTZ DEFAULT NOW(),
+    raw_data      JSONB
+);
+"""
+
 POSTGRES_CREATE_PRODUCTS = """
 CREATE TABLE IF NOT EXISTS products (
     id              SERIAL PRIMARY KEY,
@@ -106,6 +131,7 @@ CREATE TABLE IF NOT EXISTS products (
 POSTGRES_ALL_DDL = [
     POSTGRES_CREATE_SCRAPED_URLS,
     POSTGRES_CREATE_CHECKPOINTS,
+    POSTGRES_CREATE_PRODUCT_SNAPSHOTS,
     POSTGRES_CREATE_PRODUCTS,
 ]
 

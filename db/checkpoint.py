@@ -10,6 +10,7 @@ The interface is identical regardless of backend.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any, Dict, Optional
@@ -18,6 +19,7 @@ from db.models import (
     SQLITE_ALL_DDL,
     POSTGRES_CREATE_SCRAPED_URLS,
     POSTGRES_CREATE_CHECKPOINTS,
+    POSTGRES_CREATE_PRODUCT_SNAPSHOTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,6 +85,9 @@ class CheckpointManager:
         path = _sqlite_path(self.db_url)
         self._conn = await aiosqlite.connect(path)
         self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("PRAGMA synchronous=NORMAL")
+        await self._conn.execute("PRAGMA busy_timeout=10000")
         for ddl in SQLITE_ALL_DDL:
             await self._conn.execute(ddl)
         await self._conn.commit()
@@ -97,7 +102,11 @@ class CheckpointManager:
             ) from exc
 
         self._conn = await asyncpg.connect(self.db_url)
-        for ddl in (POSTGRES_CREATE_SCRAPED_URLS, POSTGRES_CREATE_CHECKPOINTS):
+        for ddl in (
+            POSTGRES_CREATE_SCRAPED_URLS,
+            POSTGRES_CREATE_CHECKPOINTS,
+            POSTGRES_CREATE_PRODUCT_SNAPSHOTS,
+        ):
             await self._conn.execute(ddl)
 
     async def close(self) -> None:
@@ -239,9 +248,13 @@ class CheckpointManager:
                 await self._conn.execute(
                     "DELETE FROM scraped_urls WHERE site = ?", (site,)
                 )
+                await self._conn.execute(
+                    "DELETE FROM product_snapshots WHERE site = ?", (site,)
+                )
             else:
                 await self._conn.execute("DELETE FROM checkpoints")
                 await self._conn.execute("DELETE FROM scraped_urls")
+                await self._conn.execute("DELETE FROM product_snapshots")
             await self._conn.commit()
         else:
             if site:
@@ -251,6 +264,123 @@ class CheckpointManager:
                 await self._conn.execute(
                     "DELETE FROM scraped_urls WHERE site = $1", site
                 )
+                await self._conn.execute(
+                    "DELETE FROM product_snapshots WHERE site = $1", site
+                )
             else:
                 await self._conn.execute("DELETE FROM checkpoints")
                 await self._conn.execute("DELETE FROM scraped_urls")
+                await self._conn.execute("DELETE FROM product_snapshots")
+
+    # ------------------------------------------------------------------
+    # Product snapshot tracking for incremental exports
+    # ------------------------------------------------------------------
+
+    def _generate_product_id(self, site: str, product_url: str) -> str:
+        """Return a stable product id for a (site, url) pair."""
+        return hashlib.md5(f"{site}:{product_url}".encode("utf-8")).hexdigest()
+
+    async def get_previous_snapshot(self, product_id: str) -> Optional[Dict[str, Any]]:
+        """Return the last saved snapshot for a product, if present."""
+        if self._backend == "sqlite":
+            cursor = await self._conn.execute(
+                """SELECT price, stock_status, raw_data
+                   FROM product_snapshots
+                   WHERE product_id = ?""",
+                (product_id,),
+            )
+            row = await cursor.fetchone()
+        else:
+            row = await self._conn.fetchrow(
+                """SELECT price, stock_status, raw_data
+                   FROM product_snapshots
+                   WHERE product_id = $1""",
+                product_id,
+            )
+
+        if not row:
+            return None
+
+        raw_data = row[2]
+        if isinstance(raw_data, str):
+            try:
+                raw_data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                raw_data = {}
+        return {
+            "price": row[0],
+            "stock_status": row[1],
+            "raw_data": raw_data or {},
+        }
+
+    async def has_changed(
+        self,
+        product_id: str,
+        current_price: Optional[float],
+        current_stock: str,
+    ) -> bool:
+        """Return True when a product is new or its tracked fields changed."""
+        previous = await self.get_previous_snapshot(product_id)
+        if not previous:
+            return True
+
+        prev_price = previous.get("price")
+        if prev_price is None or current_price is None:
+            price_changed = prev_price != current_price
+        else:
+            price_changed = abs(float(prev_price) - float(current_price)) > 0.01
+
+        stock_changed = (previous.get("stock_status") or "") != (current_stock or "")
+        return price_changed or stock_changed
+
+    async def update_snapshot(
+        self,
+        product_id: str,
+        site: str,
+        product_url: str,
+        price: Optional[float],
+        stock_status: str,
+        raw_data: Dict[str, Any],
+    ) -> None:
+        """Upsert the latest snapshot for a product."""
+        if self._backend == "sqlite":
+            await self._conn.execute(
+                """INSERT INTO product_snapshots
+                       (product_id, site, product_url, price, stock_status, last_seen, raw_data)
+                   VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                   ON CONFLICT(product_id) DO UPDATE SET
+                       site         = excluded.site,
+                       product_url  = excluded.product_url,
+                       price        = excluded.price,
+                       stock_status = excluded.stock_status,
+                       last_seen    = CURRENT_TIMESTAMP,
+                       raw_data     = excluded.raw_data""",
+                (
+                    product_id,
+                    site,
+                    product_url,
+                    price,
+                    stock_status,
+                    json.dumps(raw_data or {}, ensure_ascii=False),
+                ),
+            )
+            await self._conn.commit()
+        else:
+            await self._conn.execute(
+                """INSERT INTO product_snapshots
+                       (product_id, site, product_url, price, stock_status, raw_data)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (product_id) DO UPDATE SET
+                       site         = EXCLUDED.site,
+                       product_url  = EXCLUDED.product_url,
+                       price        = EXCLUDED.price,
+                       stock_status = EXCLUDED.stock_status,
+                       last_seen    = NOW(),
+                       raw_data     = EXCLUDED.raw_data""",
+                product_id,
+                site,
+                product_url,
+                price,
+                stock_status,
+                raw_data or {},
+            )

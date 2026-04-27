@@ -28,6 +28,7 @@ from bs4 import BeautifulSoup
 
 from . import detect_storefront_type
 from .base import BaseScraper
+from .detail_helpers import enrich_product_fields, extract_best_text, extract_specifications
 from .utils import (
     clean_part_number,
     clean_price,
@@ -35,7 +36,13 @@ from .utils import (
     get_headers,
     random_delay,
 )
-from utils.cleaners import first_match
+from utils.cleaners import (
+    clean_text,
+    extract_compatibility_text,
+    extract_oem_references,
+    extract_part_number,
+    first_match,
+)
 from utils.jina import fetch_via_jina
 from utils.proxies import ProxyManager
 
@@ -277,8 +284,32 @@ class EgyCarPartsScraper(BaseScraper):
         category_name: Optional[str] = None,
         start_page: int = 1,
     ) -> List[Dict[str, Any]]:
-        """Paginate through a category and return all product stubs."""
-        products: List[Dict[str, Any]] = []
+        """
+        Paginate through a category and return all product stubs.
+
+        For Shopify sites this first tries the /products.json bulk API which
+        returns full product data (vendor, description, stock, variants) in a
+        single request per page – no detail-page visits needed.
+        """
+        # ── Shopify bulk API fast-path ────────────────────────────────────
+        if self.config.get("type") == "shopify" or self._looks_shopify(category_url):
+            products = await self._scrape_shopify_products_json(
+                category_url, category_name=category_name, start_page=start_page
+            )
+            if products:
+                logger.info(
+                    "Category '%s' yielded %d products (Shopify JSON)",
+                    category_name or category_url,
+                    len(products),
+                )
+                return products
+            logger.debug(
+                "Shopify JSON endpoint unavailable for %s – falling back to HTML",
+                category_url,
+            )
+
+        # ── HTML fallback ─────────────────────────────────────────────────
+        products_html: List[Dict[str, Any]] = []
         seen_urls: set[str] = set()
         page_num = start_page
         page_url: Optional[str] = self._page_url(category_url, page_num)
@@ -299,7 +330,7 @@ class EgyCarPartsScraper(BaseScraper):
                 product_url = product.get("url", "")
                 if product_url and product_url not in seen_urls:
                     seen_urls.add(product_url)
-                    products.append(product)
+                    products_html.append(product)
 
             next_sel = self.config.get("next_page", "a.pagination__next")
             next_tag = soup.select_one(next_sel)
@@ -313,9 +344,160 @@ class EgyCarPartsScraper(BaseScraper):
         logger.info(
             "Category '%s' yielded %d products",
             category_name or category_url,
-            len(products),
+            len(products_html),
         )
+        return products_html
+
+    def _looks_shopify(self, url: str) -> bool:
+        """Heuristic: URL contains /collections/ — strong Shopify indicator."""
+        return "/collections/" in url
+
+    async def _scrape_shopify_products_json(
+        self,
+        category_url: str,
+        *,
+        category_name: Optional[str],
+        start_page: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch /products.json?limit=250&page=N for the given Shopify collection.
+
+        Returns an empty list if the endpoint is unavailable so the caller can
+        fall back to HTML scraping.
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(category_url)
+        # Build the products.json URL: /collections/{slug}/products.json
+        json_path = parsed.path.rstrip("/") + "/products.json"
+        products: List[Dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        limit = 250
+
+        for page in range(start_page, start_page + self.max_pages):
+            query = f"limit={limit}&page={page}"
+            api_url = urlunparse(
+                (parsed.scheme, parsed.netloc, json_path, "", query, "")
+            )
+            body, _ = await self._fetch(api_url, as_json=True)
+            if not body or not isinstance(body, dict):
+                break
+
+            raw_products = body.get("products", [])
+            if not raw_products:
+                break
+
+            for item in raw_products:
+                if not isinstance(item, dict):
+                    continue
+                product = self._map_shopify_product_json(item, category_name)
+                url = product.get("url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    products.append(product)
+
+            if len(raw_products) < limit:
+                break  # last page
+
+            await random_delay(self.delay_min, self.delay_max)
+
         return products
+
+    def _map_shopify_product_json(
+        self,
+        item: Dict[str, Any],
+        category_name: Optional[str],
+    ) -> Dict[str, Any]:
+        """Map a single entry from /products.json to the canonical product schema."""
+        from scrapers.utils import clean_part_number, clean_price
+        from utils.cleaners import (
+            extract_compatibility_text,
+            extract_oem_references,
+            extract_part_number,
+        )
+
+        handle = item.get("handle", "")
+        url = f"{self.base_url}/products/{handle}" if handle else ""
+
+        variants = item.get("variants", [])
+        first = variants[0] if variants else {}
+
+        # Price from first variant (Shopify stores prices in cents as strings)
+        raw_price = str(first.get("price", ""))
+        price = _normalise_shopify_money(first.get("price"))
+
+        # Stock: available flag on first variant
+        available = first.get("available", None)
+        if available is True:
+            stock_status = "in_stock"
+        elif available is False:
+            stock_status = "out_of_stock"
+        else:
+            stock_status = "unknown"
+
+        # Image
+        images = item.get("images", [])
+        image_url = ""
+        if images:
+            src = images[0].get("src", "") if isinstance(images[0], dict) else str(images[0])
+            image_url = ("https:" + src) if src.startswith("//") else src
+
+        # Description
+        description = _strip_html(item.get("body_html", ""))
+
+        # Part number
+        sku = str(first.get("sku", "") or "")
+        part_number = clean_part_number(sku) or extract_part_number(description)
+
+        # Tags → OEM references and compatibility
+        raw_tags = item.get("tags", [])
+        if isinstance(raw_tags, str):
+            tags = [t.strip() for t in raw_tags.split(",") if t.strip()]
+        else:
+            tags = [str(t) for t in raw_tags if str(t).strip()]
+
+        metadata_text = "\n".join(filter(None, [description, "\n".join(tags)]))
+        compatibility_text = extract_compatibility_text(metadata_text)
+        oem_references = extract_oem_references(metadata_text)
+
+        # Specifications from options
+        specs: Dict[str, str] = {}
+        for opt in item.get("options", []):
+            if isinstance(opt, dict):
+                specs[opt.get("name", "")] = ", ".join(opt.get("values", []))
+        product_type = str(item.get("product_type", "") or "")
+        if product_type:
+            specs["Product type"] = product_type
+
+        return {
+            "name": str(item.get("title", "")),
+            "url": url,
+            "price": price,
+            "raw_price": raw_price,
+            "vendor": str(item.get("vendor", "")),
+            "part_number": part_number,
+            "image_url": image_url,
+            "stock_status": stock_status,
+            "category": category_name or "",
+            "source": self.source,
+            "description": description,
+            "specifications": specs,
+            "variants": [
+                {
+                    "title": v.get("title"),
+                    "sku": v.get("sku"),
+                    "price": _normalise_shopify_money(v.get("price")),
+                    "available": v.get("available"),
+                }
+                for v in variants
+                if isinstance(v, dict)
+            ],
+            "tags": tags,
+            "compatibility_text": compatibility_text,
+            "oem_references": oem_references,
+            "data_source": "shopify_products_json",
+            "listing_only": False,
+        }
 
     def _page_url(self, base: str, page: int) -> str:
         """Construct a paginated URL using config-driven rules."""
@@ -455,10 +637,29 @@ class EgyCarPartsScraper(BaseScraper):
         if lowered_name in {"quick view", "عرض سريع"}:
             return None
 
+        # Stock detection: CSS classes (reliable on Shopify) then text fallback
+        item_classes = " ".join(item.get("class", []) if hasattr(item, "get") else []).lower()
         stock_text = item.get_text(" ", strip=True).lower()
-        if "out of stock" in stock_text or "sold out" in stock_text:
+        if (
+            "sold-out" in item_classes
+            or "sold_out" in item_classes
+            or "out-of-stock" in item_classes
+            or "out_of_stock" in item_classes
+            or "out of stock" in stock_text
+            or "sold out" in stock_text
+            or "نفذ" in stock_text
+            or "غير متوفر" in stock_text
+        ):
             stock_status = "out_of_stock"
-        elif "in stock" in stock_text or "add to cart" in stock_text:
+        elif (
+            "in-stock" in item_classes
+            or "in_stock" in item_classes
+            or "available" in item_classes
+            or "in stock" in stock_text
+            or "add to cart" in stock_text
+            or "اضف للسلة" in stock_text
+            or "أضف للسلة" in stock_text
+        ):
             stock_status = "in_stock"
         else:
             stock_status = "unknown"
@@ -532,9 +733,18 @@ class EgyCarPartsScraper(BaseScraper):
         description = re.sub(r"\s+", " ", item.get_text(" ", strip=True)).strip()
         if description == product.get("name", ""):
             description = ""
+        compatibility_text = extract_compatibility_text(description)
+        oem_references = extract_oem_references(description)
+        listing_part_number = (
+            clean_part_number(product.get("part_number", ""))
+            or extract_part_number(description)
+        )
 
         return {
             "description": description,
+            "part_number": listing_part_number,
+            "compatibility_text": compatibility_text,
+            "oem_references": oem_references,
             "specifications": {},
             "variants": [],
             "data_source": "listing_only",
@@ -566,20 +776,42 @@ class EgyCarPartsScraper(BaseScraper):
         for opt in data.get("options", []):
             if isinstance(opt, dict):
                 specs[opt.get("name", "")] = ", ".join(opt.get("values", []))
+        product_type = clean_text(str(data.get("product_type", "") or ""))
+        if product_type:
+            specs["Product type"] = product_type
+
+        description = _strip_html(data.get("body_html", ""))
+        raw_tags = data.get("tags", [])
+        if isinstance(raw_tags, str):
+            tags = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+        elif isinstance(raw_tags, list):
+            tags = [clean_text(str(tag)) for tag in raw_tags if str(tag).strip()]
+        else:
+            tags = []
+        metadata_text = "\n".join(
+            value
+            for value in (
+                description,
+                "\n".join(tags),
+                json.dumps(data, ensure_ascii=False, default=str),
+            )
+            if value
+        )
+        part_number = clean_part_number(
+            (data.get("variants") or [{}])[0].get("sku", "")
+        ) or extract_part_number(metadata_text)
 
         return {
             "url": url,
             "name": product_name,
-            "vendor": data.get("vendor", ""),
-            "part_number": clean_part_number(
-                (data.get("variants") or [{}])[0].get("sku", "")
-            ),
+            "vendor": clean_text(str(data.get("vendor", "") or "")),
+            "part_number": part_number,
             "price": _normalise_shopify_money(first.get("price")),
             "raw_price": str(first.get("price", "")),
             "compare_at_price": _normalise_shopify_money(first.get("compare_at_price")),
             "image_url": image_url,
             "stock_status": "in_stock" if first.get("available") else "out_of_stock",
-            "description": _strip_html(data.get("body_html", "")),
+            "description": description,
             "specifications": specs,
             "variants": [
                 {
@@ -591,7 +823,11 @@ class EgyCarPartsScraper(BaseScraper):
                 for variant in variants
                 if isinstance(variant, dict)
             ],
-            "tags": data.get("tags", []),
+            "tags": tags,
+            "compatibility_text": extract_compatibility_text(
+                "\n".join(filter(None, [description, "\n".join(tags)]))
+            ),
+            "oem_references": extract_oem_references(metadata_text),
             "source": self.source,
             "data_source": "shopify_json",
         }
@@ -613,12 +849,15 @@ class EgyCarPartsScraper(BaseScraper):
             ],
         ) or ""
 
+        description_selector = self.config.get("description_selector", "")
+        description_selectors = _split_selectors(description_selector)
         raw_price = first_match(
             soup,
             [
                 (".price__current", None),
                 (".product__price", None),
                 (".price", None),
+                ("[class*='price']", None),
                 ("[itemprop='price']", "content"),
                 ('meta[property="og:price:amount"]', "content"),
             ],
@@ -644,13 +883,30 @@ class EgyCarPartsScraper(BaseScraper):
 
         description = first_match(
             soup,
-            [
+            [(selector, None) for selector in description_selectors]
+            + [
                 (".product__description", None),
                 ("#product-description", None),
+                (".product-description", None),
                 (".description", None),
                 ("[itemprop='description']", None),
+                ('meta[name="description"]', "content"),
+                ('meta[property="og:description"]', "content"),
             ],
-        ) or ""
+        ) or extract_best_text(
+            soup,
+            description_selectors
+            + [
+                ".product__description",
+                "#product-description",
+                ".product-description",
+                ".description",
+                "[itemprop='description']",
+                "meta[name='description']",
+                "meta[property='og:description']",
+            ],
+            min_length=20,
+        )
 
         image_url = first_match(
             soup,
@@ -663,14 +919,14 @@ class EgyCarPartsScraper(BaseScraper):
         if image_url.startswith("//"):
             image_url = "https:" + image_url
 
-        specs: Dict[str, str] = {}
-        for row in soup.select("table.product-specs tr, .specifications tr, table tr"):
-            cells = row.select("td, th")
-            if len(cells) >= 2:
-                key = cells[0].get_text(" ", strip=True)
-                value = cells[1].get_text(" ", strip=True)
-                if key and value:
-                    specs[key] = value
+        specs = extract_specifications(soup)
+        enrichment = enrich_product_fields(
+            soup,
+            description=description,
+            vendor=vendor,
+            part_number=sku,
+            specs=specs,
+        )
 
         stock_text = soup.get_text(" ", strip=True).lower()
         if "out of stock" in stock_text or "sold out" in stock_text:
@@ -683,14 +939,16 @@ class EgyCarPartsScraper(BaseScraper):
         return {
             "url": url,
             "name": name,
-            "vendor": vendor,
-            "part_number": clean_part_number(sku),
+            "vendor": enrichment.get("vendor", vendor),
+            "part_number": enrichment.get("part_number") or clean_part_number(sku),
             "price": clean_price(raw_price),
             "raw_price": raw_price,
             "image_url": image_url,
             "stock_status": stock_status,
-            "description": description,
-            "specifications": specs,
+            "description": enrichment.get("description", description),
+            "specifications": enrichment.get("specifications", specs),
+            "compatibility_text": enrichment.get("compatibility_text", ""),
+            "oem_references": enrichment.get("oem_references", []),
             "variants": [],
             "source": self.source,
             "data_source": "html_fallback",
@@ -881,11 +1139,42 @@ class EgyCarPartsScraper(BaseScraper):
                 else:
                     stock_status = "unknown"
 
+                specs = extract_specifications(soup)
+                additional_props = current.get("additionalProperty", [])
+                if isinstance(additional_props, dict):
+                    additional_props = [additional_props]
+                if isinstance(additional_props, list):
+                    for prop in additional_props:
+                        if not isinstance(prop, dict):
+                            continue
+                        key = clean_text(
+                            str(prop.get("name") or prop.get("propertyID") or "")
+                        )
+                        value = clean_text(
+                            str(prop.get("value") or prop.get("valueReference") or "")
+                        )
+                        if key and value and key not in specs:
+                            specs[key] = value
+
+                description = _strip_html(current.get("description", ""))
+                enrichment = enrich_product_fields(
+                    soup,
+                    description=description,
+                    vendor=str(brand or ""),
+                    part_number=str(
+                        current.get("sku")
+                        or current.get("mpn")
+                        or current.get("productID", "")
+                    ),
+                    specs=specs,
+                )
+
                 return {
                     "url": url,
                     "name": current.get("name", ""),
-                    "vendor": brand,
-                    "part_number": clean_part_number(
+                    "vendor": enrichment.get("vendor", str(brand or "")),
+                    "part_number": enrichment.get("part_number")
+                    or clean_part_number(
                         current.get("sku")
                         or current.get("mpn")
                         or current.get("productID", "")
@@ -894,8 +1183,10 @@ class EgyCarPartsScraper(BaseScraper):
                     "raw_price": str(offers.get("price", "")),
                     "image_url": image,
                     "stock_status": stock_status,
-                    "description": _strip_html(current.get("description", "")),
-                    "specifications": {},
+                    "description": enrichment.get("description", description),
+                    "specifications": enrichment.get("specifications", specs),
+                    "compatibility_text": enrichment.get("compatibility_text", ""),
+                    "oem_references": enrichment.get("oem_references", []),
                     "variants": [],
                     "source": self.source,
                     "data_source": "jsonld_product",

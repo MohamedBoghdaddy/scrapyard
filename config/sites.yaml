@@ -74,12 +74,12 @@ autospare: &autospare
   categories_selector: 'a[href*="/category/"]'
   category_link_patterns:
     - "/category/"
-  product_container: 'a[href*="/products/"]'
+  product_container: ".noon-card, .card-info, .col-lg-4, .col-md-6"
   product_link: 'a[href*="/products/"]'
   product_link_patterns:
     - "/products/"
   product_title: 'a[href*="/products/"], h3, h2'
-  price_selector: ".price, [class*='price']"
+  price_selector: ".current-price, .price-row, .price-container, .alt-price, [class*='price']"
   vendor_selector: ".vendor, .brand"
   next_page: 'a[rel="next"], a[href*="page="]'
   use_javascript: false
@@ -168,6 +168,7 @@ a-part: &a_part
   pre_extract_click_selector: ".btn-show"
   pagination_button_selector: "button"
   extract_from_listing: true
+  backfill_missing_prices: false
   use_javascript: true
   wait_until: "domcontentloaded"
   post_nav_delay_ms: 4000
@@ -193,6 +194,8 @@ yourparts: &yourparts
   platform_type: "Next.js"
   currency: "EGP"
   engine: "playwright"
+  auto_details: true
+  parse_next_data: true
   categories_selector: 'a[href*="/products?product_type="], a[href*="/products?category_id="]'
   category_link_patterns:
     - "/products?product_type="
@@ -313,6 +316,7 @@ partfinderegypt: &partfinderegypt
   max_retries: 3
   timeout: 30
   max_pages: 5
+  backfill_missing_prices: false
   notes: "Inventory lookup by brand/model rather than a traditional category tree. Seeded brand pages are the reliable entry points."
 
 elboltygroup: &elboltygroup

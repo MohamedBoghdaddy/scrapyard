@@ -1,4 +1,4 @@
-# Scrapyard v3.1
+# Scrapyard v3.2
 
 Async car-parts scraper for Egyptian and regional storefronts, with both HTTP
 and Playwright engines, config-driven site onboarding, and export formats for
@@ -15,6 +15,10 @@ CSV, JSON, Excel, SQLite, PostgreSQL, and MySQL.
 - QA validation with `_invalid.csv` output for malformed rows
 - Optional detail-page enrichment with `--details`
 - Multi-sheet Excel export designed to be easier for LLM workflows
+- Incremental update detection backed by persistent product snapshots
+- Bilingual compatibility parsing for English and Arabic vehicle references
+- Daily scheduling script with archive rotation and resume support
+- FastAPI dashboard for browsing the latest exports and price trends
 
 ## Supported Site IDs
 
@@ -86,6 +90,18 @@ Enable LLM fallback:
 
 ```bash
 python main.py --site tawfiqia --llm
+```
+
+Incremental export with checkpoint snapshots:
+
+```bash
+python main.py --site egycarparts --format excel --resume --incremental
+```
+
+Force a full re-scrape even when checkpoints exist:
+
+```bash
+python main.py --site egycarparts --format excel --resume --incremental --force
 ```
 
 ## Configuration
@@ -171,6 +187,35 @@ page. That means:
 - `type: custom` can still benefit from Shopify JSON when it is actually present
 - Sites such as `elcatalog` can stay config-driven without hard-coding platform assumptions into the scraper
 
+## Incremental Updates
+
+When `--incremental` is enabled, Scrapyard compares each product against the
+latest snapshot stored in `scraper_state.db`.
+
+- New products are exported
+- Existing products are exported only when `price` or `stock_status` changes
+- Full raw product payloads are preserved in the snapshot table
+- `--force` disables skip logic for categories while still letting incremental export decide what changed
+
+This is useful for scheduled runs where you want smaller daily delta files
+without losing a persistent "current state" database.
+
+Per-site incremental exports are delta-oriented by design. The scheduler also
+builds a combined `all_sites_<timestamp>.xlsx` workbook from the snapshot
+state so dashboards and cross-vendor analysis can work from a fuller catalog
+view.
+
+## Vehicle Compatibility Parsing
+
+Compatibility extraction is handled in `utils/storage.py`.
+
+- Regex parsing works for English patterns such as `Toyota Corolla 2015-2020`
+- Regex parsing also works for Arabic patterns such as `تويوتا كورولا 2015-2020`
+- If `--llm` is enabled and regex extraction fails, Scrapyard can fall back to the OpenAI client
+
+Parsed fitment rows are written into the `compatibility` Excel sheet and a JSON
+representation is preserved on each product row.
+
 ## Excel Export
 
 `--format excel` now writes a multi-sheet workbook intended to be easier to use
@@ -178,7 +223,9 @@ for downstream analysis and LLM workflows.
 
 Sheets:
 
-- `products`: flat primary table
+- `products`: flat primary table containing all websites in the combined workbook
+- `site_<website>`: one worksheet per website when multiple sites are exported together
+- `aggregated_prices`: cross-vendor grouping and average price statistics
 - `vendors`: vendor lookup table
 - `compatibility`: structured fitment rows when compatibility data exists
 - `categories`: unique category list
@@ -205,6 +252,20 @@ Important `products` columns:
 - `oem_references`
 - `notes`
 
+The `aggregated_prices` sheet groups products by a normalized identifier and
+includes:
+
+- `canonical_id`
+- `part_number`
+- `part_name`
+- `avg_price_egp`
+- `min_price_egp`
+- `max_price_egp`
+- `vendor_count`
+- `vendors`
+- `vendor_prices`
+- `last_updated`
+
 ## Output Formats
 
 - `csv`: flat row export
@@ -224,6 +285,41 @@ Main code paths:
 - `scrapers/egycarparts.py`: HTTP hybrid scraper
 - `scrapers/alkhaleeg.py`: Playwright scraper for JS-heavy sites
 - `utils/storage.py`: file/database export logic
+- `db/checkpoint.py`: checkpointing and snapshot-based incremental change detection
+- `dashboard.py`: FastAPI dashboard and JSON endpoints
+- `run_weekly.sh`: scheduled multi-site runner with archive rotation
+
+## Scheduler
+
+`run_weekly.sh` loops over every configured site, uses `--resume` and
+`--incremental`, archives older exports, and builds a combined
+`all_sites_<timestamp>.xlsx` workbook from the latest snapshot state.
+
+Example:
+
+```bash
+bash run_weekly.sh
+```
+
+The combined workbook is what powers cross-vendor aggregation and gives the
+dashboard a fuller view of the latest catalog state.
+
+## Dashboard
+
+Start the FastAPI dashboard locally:
+
+```bash
+uvicorn dashboard:app --reload
+```
+
+Useful routes:
+
+- `/`: site index
+- `/site/{site}`: HTML dashboard with filters and trend chart
+- `/aggregated`: HTML cross-vendor price view
+- `/api/site/{site}`: filtered JSON records
+- `/api/aggregated/latest`: aggregated JSON records
+- `/api/trends/{site}`: JSON price changes between the latest two snapshots
 
 When onboarding a new site:
 
