@@ -212,8 +212,21 @@ logs/*.log
 *.db
 scraper_state.db
 
-# Environment / secrets
+# Environment / secrets — never commit these
 .env
+.env.local
+.env.*.local
+*.env
+!.env.example
+
+# Scrapyard storage
+storage/
+
+# API job database
+api/jobs.db
+
+# Temp Excel files
+*.xlsx.tmp
 
 # Playwright browser binaries
 playwright/.local-browsers/

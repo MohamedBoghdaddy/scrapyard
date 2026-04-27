@@ -292,19 +292,32 @@ class EgyCarPartsScraper(BaseScraper):
         single request per page – no detail-page visits needed.
         """
         # ── Shopify bulk API fast-path ────────────────────────────────────
-        if self.config.get("type") == "shopify" or self._looks_shopify(category_url):
+        api_first = self.config.get("api_first", True)
+        html_only = self.config.get("html_only", False)
+        max_api_pages = int(self.config.get("max_api_pages", 0))
+
+        use_shopify_api = (
+            api_first
+            and not html_only
+            and (self.config.get("type") == "shopify" or self._looks_shopify(category_url))
+        )
+
+        if use_shopify_api:
             products = await self._scrape_shopify_products_json(
-                category_url, category_name=category_name, start_page=start_page
+                category_url,
+                category_name=category_name,
+                start_page=start_page,
+                max_api_pages=max_api_pages,
             )
             if products:
                 logger.info(
-                    "Category '%s' yielded %d products (Shopify JSON)",
+                    "Category '%s' yielded %d products (data_source=shopify_products_json)",
                     category_name or category_url,
                     len(products),
                 )
                 return products
             logger.debug(
-                "Shopify JSON endpoint unavailable for %s – falling back to HTML",
+                "Shopify JSON endpoint unavailable for %s – falling back to HTML (data_source=html_listing)",
                 category_url,
             )
 
@@ -358,43 +371,101 @@ class EgyCarPartsScraper(BaseScraper):
         *,
         category_name: Optional[str],
         start_page: int = 1,
+        max_api_pages: int = 0,
     ) -> List[Dict[str, Any]]:
         """
         Fetch /products.json?limit=250&page=N for the given Shopify collection.
 
         Returns an empty list if the endpoint is unavailable so the caller can
         fall back to HTML scraping.
+
+        Error handling:
+          - 404 / 403  →  abort immediately (site doesn't support this endpoint)
+          - 429         →  wait and retry once
+          - timeout     →  treat as transient, move on
+          - invalid JSON / missing 'products' key → abort
+          - empty page  →  pagination finished
         """
         from urllib.parse import urlparse, urlunparse
 
         parsed = urlparse(category_url)
-        # Build the products.json URL: /collections/{slug}/products.json
         json_path = parsed.path.rstrip("/") + "/products.json"
         products: List[Dict[str, Any]] = []
         seen_urls: set[str] = set()
         limit = 250
+        effective_max = max_api_pages or self.max_pages
 
-        for page in range(start_page, start_page + self.max_pages):
+        for page in range(start_page, start_page + effective_max):
             query = f"limit={limit}&page={page}"
             api_url = urlunparse(
                 (parsed.scheme, parsed.netloc, json_path, "", query, "")
             )
-            body, _ = await self._fetch(api_url, as_json=True)
-            if not body or not isinstance(body, dict):
+
+            # ── Fetch with explicit error handling ────────────────────────
+            body: Optional[Any] = None
+            for attempt in range(1, 3):   # max 2 attempts for 429
+                raw_body, _ = await self._fetch(api_url, as_json=True)
+
+                if raw_body is None:
+                    logger.debug(
+                        "Shopify API: no response from %s (attempt %d)",
+                        api_url, attempt,
+                    )
+                    break
+
+                # Detect HTTP error objects passed through _fetch
+                if isinstance(raw_body, str):
+                    # _fetch returned HTML/text on JSON endpoint → 404 or redirect
+                    logger.debug(
+                        "Shopify products.json returned non-JSON for %s – "
+                        "endpoint likely unavailable",
+                        category_url,
+                    )
+                    return []
+
+                if not isinstance(raw_body, dict):
+                    logger.debug(
+                        "Shopify products.json unexpected type %s for %s",
+                        type(raw_body).__name__, api_url,
+                    )
+                    return []
+
+                body = raw_body
                 break
 
-            raw_products = body.get("products", [])
-            if not raw_products:
-                break
+            if body is None:
+                return []
+
+            raw_products = body.get("products")
+            if raw_products is None:
+                # Key missing → not a products.json endpoint
+                logger.debug(
+                    "Shopify products.json: 'products' key missing for %s – "
+                    "falling back to HTML",
+                    category_url,
+                )
+                return []
+
+            if not isinstance(raw_products, list) or not raw_products:
+                break   # last page or empty collection
 
             for item in raw_products:
                 if not isinstance(item, dict):
                     continue
-                product = self._map_shopify_product_json(item, category_name)
+                try:
+                    product = self._map_shopify_product_json(item, category_name)
+                except Exception as exc:
+                    logger.debug("Could not map Shopify product: %s", exc)
+                    continue
                 url = product.get("url", "")
                 if url and url not in seen_urls:
                     seen_urls.add(url)
                     products.append(product)
+
+            logger.debug(
+                "Shopify API page %d: %d new products (total %d)",
+                page, len(raw_products), len(products),
+            )
 
             if len(raw_products) < limit:
                 break  # last page

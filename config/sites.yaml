@@ -346,8 +346,8 @@ elboltygroup: &elboltygroup
   max_pages: 10
   notes: "Wix storefront. Seeded shop page is preserved because it is the most stable catalog entry point."
 
-# Template
-# --------
+# Template — all fields with defaults documented
+# ------------------------------------------
 # mysite:
 #   display_name: "My Site"
 #   base_url: "https://example.com"
@@ -361,6 +361,19 @@ elboltygroup: &elboltygroup
 #   product_container: "div.product"
 #   product_link: "a"
 #   product_link_patterns:
+#     - "/product/"
+#
+#   # ── Phase-2 optional fields ──────────────────────────────────────────
+#   enable_api_discovery: true          # try /products.json before HTML scraping
+#   api_first: true                     # prefer Shopify API (default: true for shopify type)
+#   html_only: false                    # force HTML scraping even on Shopify sites
+#   max_api_pages: 0                    # cap API pages per category (0 = unlimited)
+#   enable_nlp: true                    # run NLP enrichment pipeline
+#   enable_playwright_xhr_capture: true # intercept XHR JSON in Playwright scraper
+#   enable_jina_fallback: true          # use Jina when aiohttp fails (requires JINA_API_KEY)
+#   min_quality_score: 0.0             # skip products below this content quality score
+#   max_rows_per_file: 0               # split output when rows > N (0 = unlimited)
+#   notes: "Any site-specific quirks."
 #     - "/product/"
 #   product_title: "h2, h3"
 #   part_number_selector: ".sku"

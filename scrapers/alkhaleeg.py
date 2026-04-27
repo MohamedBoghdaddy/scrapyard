@@ -103,11 +103,173 @@ class AlKhaleegScraper(BaseScraper):
             await self._playwright.stop()
         logger.info("%s browser closed", self.source)
 
-    async def _new_page(self) -> Page:
+    async def _new_page(self, *, capture_xhr: bool = False) -> Page:
         page = await self._context.new_page()
         page.set_default_navigation_timeout(NAV_TIMEOUT)
         page.set_default_timeout(LOAD_TIMEOUT)
+        if capture_xhr:
+            page._xhr_captures: list = []   # type: ignore[attr-defined]
+            page.on("response", self._make_xhr_handler(page))
         return page
+
+    def _make_xhr_handler(self, page: Page):
+        """
+        Build an async response listener that captures JSON API responses.
+
+        Captured responses are stored on page._xhr_captures for later parsing.
+        Only endpoints that look like product/listing APIs are captured.
+        """
+        _PRODUCT_KEYWORDS = (
+            "product", "listing", "catalog", "item", "search",
+            "collection", "inventory", "catalogue",
+        )
+        _EXCLUDE_KEYWORDS = (
+            "font", "image", "icon", "css", "analytics",
+            "gtag", "pixel", "fbq",
+        )
+
+        async def _on_response(response) -> None:
+            try:
+                url_lower = response.url.lower()
+                ct = response.headers.get("content-type", "")
+                if "application/json" not in ct:
+                    return
+                if not any(kw in url_lower for kw in _PRODUCT_KEYWORDS):
+                    return
+                if any(kw in url_lower for kw in _EXCLUDE_KEYWORDS):
+                    return
+                data = await response.json()
+                if isinstance(data, (dict, list)):
+                    page._xhr_captures.append(   # type: ignore[attr-defined]
+                        {"url": response.url, "data": data}
+                    )
+                    logger.debug(
+                        "XHR captured: %s (%d bytes)",
+                        response.url, len(str(data)),
+                    )
+            except Exception as exc:
+                logger.debug("XHR handler error: %s", exc)
+
+        return _on_response
+
+    def _extract_products_from_xhr(
+        self,
+        captures: list,
+        category_name: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Try to parse captured XHR JSON responses into product dicts.
+
+        Looks for common e-commerce API shapes:
+          {"products": [...]}
+          {"items": [...]}
+          {"data": {"products": [...]}}
+          [{"id": ..., "title": ...}, ...]
+
+        Returns an empty list when no parseable product data is found.
+        """
+        products: List[Dict[str, Any]] = []
+        for capture in captures:
+            data = capture.get("data")
+            items: list = []
+
+            # Unwrap common shapes
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                for key in ("products", "items", "results", "data", "records"):
+                    candidate = data.get(key)
+                    if isinstance(candidate, list) and candidate:
+                        items = candidate
+                        break
+                    if isinstance(candidate, dict):
+                        for inner_key in ("products", "items", "results"):
+                            inner = candidate.get(inner_key)
+                            if isinstance(inner, list) and inner:
+                                items = inner
+                                break
+                        if items:
+                            break
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                # Try to build a product from the item
+                product = self._map_xhr_item(item, category_name, capture["url"])
+                if product:
+                    products.append(product)
+
+        if products:
+            logger.info(
+                "XHR extraction: %d products from %d captures",
+                len(products), len(captures),
+            )
+        return products
+
+    def _map_xhr_item(
+        self,
+        item: Dict[str, Any],
+        category_name: Optional[str],
+        source_url: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Map a single XHR response item to the canonical product schema."""
+        # Name field
+        name = (
+            item.get("title")
+            or item.get("name")
+            or item.get("product_title")
+            or item.get("product_name")
+            or ""
+        )
+        if not name:
+            return None
+
+        # URL
+        handle = item.get("handle") or item.get("slug") or ""
+        url = item.get("url") or item.get("link") or ""
+        if not url and handle:
+            parsed_source = urlparse(source_url)
+            url = f"{parsed_source.scheme}://{parsed_source.netloc}/products/{handle}"
+
+        # Price
+        price_raw = (
+            item.get("price")
+            or item.get("price_min")
+            or item.get("variants", [{}])[0].get("price") if item.get("variants") else None
+            or ""
+        )
+
+        # Stock
+        available = item.get("available")
+        if available is True:
+            stock_status = "in_stock"
+        elif available is False:
+            stock_status = "out_of_stock"
+        else:
+            stock_status = "unknown"
+
+        # Vendor / brand
+        vendor = item.get("vendor") or item.get("brand") or item.get("manufacturer") or ""
+
+        return {
+            "name": str(name),
+            "url": str(url) if url else "",
+            "price": clean_price(str(price_raw)),
+            "raw_price": str(price_raw),
+            "vendor": str(vendor),
+            "part_number": clean_part_number(
+                str(item.get("sku") or item.get("mpn") or item.get("part_number") or "")
+            ),
+            "image_url": str(
+                item.get("featured_image") or item.get("image") or
+                item.get("thumbnail") or ""
+            ),
+            "stock_status": stock_status,
+            "category": category_name or "",
+            "source": self.source,
+            "data_source": "playwright_xhr",
+            "listing_only": False,
+        }
 
     async def _goto(self, page: Page, url: str) -> Tuple[bool, str]:
         """
@@ -224,12 +386,32 @@ class AlKhaleegScraper(BaseScraper):
         """Scrape a rendered category page, including button-driven pagination."""
         products: List[Dict[str, Any]] = []
         seen_urls: set[str] = set()
-        page = await self._new_page()
+
+        # XHR interception: capture JSON API responses if enabled
+        xhr_enabled = bool(self.config.get("enable_playwright_xhr_capture", True))
+        page = await self._new_page(capture_xhr=xhr_enabled)
 
         try:
             ok, _ = await self._goto(page, category_url)
             if not ok:
                 return []
+
+            # ── Try XHR-captured JSON first ───────────────────────────────
+            if xhr_enabled:
+                xhr_captures = getattr(page, "_xhr_captures", [])
+                if xhr_captures:
+                    xhr_products = self._extract_products_from_xhr(
+                        xhr_captures, category_name
+                    )
+                    if xhr_products:
+                        logger.info(
+                            "Category '%s': using XHR data (%d products, data_source=playwright_xhr)",
+                            category_name or category_url,
+                            len(xhr_products),
+                        )
+                        return xhr_products
+                    # Clear for pagination
+                    page._xhr_captures.clear()   # type: ignore[attr-defined]
 
             if self.config.get("pagination_button_selector"):
                 page_num = 1

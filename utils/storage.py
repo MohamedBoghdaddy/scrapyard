@@ -42,8 +42,14 @@ SyncFormat = Literal["csv", "json", "excel", "sqlite"]
 # Lazy NLP import (gracefully absent when nlp package not installed)
 # ---------------------------------------------------------------------------
 
-def _try_nlp_enrich(products: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _try_nlp_enrich(
+    products: List[Dict[str, Any]],
+    *,
+    enabled: bool = True,
+) -> List[Dict[str, Any]]:
     """Run NLP pipeline on all products; return originals if nlp package unavailable."""
+    if not enabled:
+        return products
     try:
         from nlp.pipeline import enrich_batch_nlp, NLPConfig  # type: ignore
         cfg = NLPConfig(
@@ -360,6 +366,13 @@ class DataStorage:
         *,
         site_config: Optional[Dict[str, Any]] = None,
         run_metadata: Optional[Dict[str, Any]] = None,
+        # New safe-export parameters
+        safe_mode: bool = True,
+        max_rows_per_file: int = 0,
+        fallback_to_csv: bool = True,
+        no_excel_fallback: bool = False,
+        generate_quality_report: bool = False,
+        nlp_enabled: bool = True,
     ) -> Path:
         """
         Write *data* to *filepath* in the chosen format.
@@ -392,32 +405,64 @@ class DataStorage:
             logger.warning("No valid products to save")
             return path
 
+        # NLP enrichment — runs for ALL formats when enabled
+        enriched = _try_nlp_enrich(valid, enabled=nlp_enabled)
+
+        # Build optional quality report AFTER enrichment so NLP fields are populated
+        quality_report: Optional[Dict[str, Any]] = None
+        if generate_quality_report:
+            from utils.quality_report import build_quality_report
+            quality_report = build_quality_report(
+                enriched,
+                run_meta=run_metadata,
+                export_format=fmt,
+            )
+
         if fmt == "csv":
-            DataStorage._save_csv(valid, path)
+            saved = DataStorage._save_csv(enriched, path)
         elif fmt == "json":
-            DataStorage._save_json(valid, path)
+            DataStorage._save_json(enriched, path)
+            saved = path.with_suffix(".json")
         elif fmt == "excel":
-            DataStorage._save_excel(
-                valid,
+            saved = DataStorage._save_excel(
+                enriched,
                 path,
                 site_config=site_config,
                 run_metadata=run_metadata,
+                safe_mode=safe_mode,
+                max_rows_per_file=max_rows_per_file,
+                fallback_to_csv=fallback_to_csv,
+                no_excel_fallback=no_excel_fallback,
+                quality_report=quality_report,
             )
         elif fmt == "sqlite":
-            DataStorage._save_sqlite(valid, path)
+            DataStorage._save_sqlite(enriched, path)
+            saved = path.with_suffix(".db")
         else:
             raise ValueError(
                 "Unsupported format "
                 f"'{fmt}'. Choose from: ['csv', 'json', 'excel', 'sqlite']"
             )
-        logger.info("Saved %d records -> %s (%s)", len(valid), path, fmt)
+
+        # Persist quality report as a sidecar JSON if requested
+        if generate_quality_report and quality_report:
+            from utils.quality_report import save_quality_report
+            qr_path = path.parent / f"{path.name}_quality_report.json"
+            save_quality_report(quality_report, qr_path)
+
+        logger.info(
+            "Saved %d records → %s (%s)",
+            len(valid), path, fmt,
+        )
         return path
 
     @staticmethod
-    def _save_csv(data: List[Dict[str, Any]], path: Path) -> None:
-        DataStorage._flatten(data).to_csv(
-            path.with_suffix(".csv"), index=False, encoding="utf-8-sig"
-        )
+    def _save_csv(data: List[Dict[str, Any]], path: Path) -> Path:
+        out = path.with_suffix(".csv")
+        from utils.data_sanitizer import sanitize_dataframe
+        df = DataStorage._flatten(data)
+        sanitize_dataframe(df).to_csv(out, index=False, encoding="utf-8-sig")
+        return out
 
     @staticmethod
     def _save_json(data: List[Dict[str, Any]], path: Path) -> None:
@@ -431,17 +476,80 @@ class DataStorage:
         *,
         site_config: Optional[Dict[str, Any]] = None,
         run_metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        out = path.with_suffix(".xlsx")
+        safe_mode: bool = True,
+        max_rows_per_file: int = 0,
+        fallback_to_csv: bool = True,
+        no_excel_fallback: bool = False,
+        quality_report: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        """
+        Write an Excel workbook using the hardened writer.
+
+        If safe_mode is True (default), writes to a temp file first, validates,
+        then atomically renames. Falls back to CSV if Excel fails and
+        fallback_to_csv is True.
+
+        Returns the final output path (.xlsx or .csv).
+        """
+        from utils.excel_writer import safe_excel_write, split_and_write_excel
+        from utils.quality_report import quality_report_to_dataframe
+
         workbook = DataStorage._build_excel_workbook(
             data,
             site_config=site_config,
             run_metadata=run_metadata,
         )
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            for sheet_name, df in workbook.items():
-                df.to_excel(writer, index=False, sheet_name=sheet_name)
-                DataStorage._autosize_worksheet(writer.sheets[sheet_name])
+
+        # Attach quality report sheet when available
+        if quality_report:
+            workbook["data_quality_report"] = quality_report_to_dataframe(quality_report)
+
+        t0 = __import__("time").monotonic()
+
+        if max_rows_per_file > 0 and len(data) > max_rows_per_file:
+            results = split_and_write_excel(
+                workbook,
+                path,
+                max_rows_per_file=max_rows_per_file,
+                fallback_to_csv=fallback_to_csv,
+                no_excel_fallback=no_excel_fallback,
+            )
+            elapsed = round(__import__("time").monotonic() - t0, 2)
+            logger.info(
+                "Excel split export: %d parts in %.1fs",
+                len(results), elapsed,
+            )
+            # Return path of first part so callers get a usable path
+            return results[0].path
+
+        if safe_mode:
+            result = safe_excel_write(
+                workbook,
+                path,
+                fallback_to_csv=fallback_to_csv,
+                no_excel_fallback=no_excel_fallback,
+            )
+        else:
+            # Legacy direct write (kept for backward compat)
+            out = path.with_suffix(".xlsx")
+            with pd.ExcelWriter(str(out), engine="openpyxl") as writer:
+                for sheet_name, df in workbook.items():
+                    df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+                    DataStorage._autosize_worksheet(writer.sheets[sheet_name[:31]])
+            return out
+
+        elapsed = round(__import__("time").monotonic() - t0, 2)
+        if result.fallback_used:
+            logger.warning(
+                "Excel export failed → CSV fallback used: %s (%.1fs)",
+                result.path, elapsed,
+            )
+        else:
+            logger.info(
+                "Excel export: %d rows, %d sheets → %s (%.1fs)",
+                result.rows_written, len(result.sheets), result.path, elapsed,
+            )
+        return result.path
 
     @staticmethod
     def _save_sqlite(data: List[Dict[str, Any]], path: Path) -> None:
@@ -599,8 +707,8 @@ class DataStorage:
     ) -> Dict[str, pd.DataFrame]:
         site_cfg = site_config or {}
         meta = DataStorage._normalise_run_metadata(data, site_cfg, run_metadata)
-        # NLP enrichment — runs in-process before building sheets
-        nlp_data = _try_nlp_enrich(data)
+        # Note: NLP enrichment already applied in save() before this point
+        nlp_data = data
         products_df = DataStorage._build_products_sheet(nlp_data, site_cfg, meta)
         aggregated_df = DataStorage.aggregate_products(products_df.copy())
         vendors_df = DataStorage._build_vendors_sheet(nlp_data, site_cfg)

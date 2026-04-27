@@ -126,6 +126,16 @@ async def run(
     if args.max_pages:
         site_config["max_pages"] = args.max_pages
     site_config["llm_enabled"] = args.llm
+    # New Phase-2 flags
+    if getattr(args, "html_only", False):
+        site_config["html_only"] = True
+        site_config["api_first"] = False
+    elif getattr(args, "api_first", True):
+        site_config["api_first"] = True
+    if getattr(args, "max_api_pages", 0):
+        site_config["max_api_pages"] = args.max_api_pages
+    if getattr(args, "disable_jina", False):
+        site_config["disable_jina"] = True
 
     # ── Scraping ──────────────────────────────────────────────────────────
     all_products: List[Dict[str, Any]] = []
@@ -424,6 +434,9 @@ async def run(
     saved_path: Optional[Path] = None
     saved_count = len(all_products)
 
+    # NLP enrichment (can be disabled via --no-nlp)
+    nlp_enabled = not getattr(args, "no_nlp", False)
+
     if not args.incremental or args.format in ("postgres", "mysql"):
         await DataStorage.enrich_products_for_export(
             all_products,
@@ -482,12 +495,20 @@ async def run(
         )
         saved_count = saved
     else:
+        force_csv = getattr(args, "force_csv", False)
+        effective_format = "csv" if force_csv else args.format
         saved_path = DataStorage.save(
             all_products,
             output_path,
-            fmt=args.format,
+            fmt=effective_format,
             site_config=site_config,
             run_metadata=run_metadata,
+            safe_mode=_resolve_safe_export(args),
+            max_rows_per_file=getattr(args, "max_rows_per_file", 0),
+            fallback_to_csv=not getattr(args, "no_excel_fallback", False),
+            no_excel_fallback=getattr(args, "no_excel_fallback", False),
+            generate_quality_report=getattr(args, "quality_report", False),
+            nlp_enabled=not getattr(args, "no_nlp", False),
         )
         logger.info("Results saved to %s", saved_path)
         print(f"\nDone. {len(all_products)} products saved to: {saved_path}")
@@ -757,13 +778,14 @@ def _print_summary(summary: Dict[str, Any]) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scrapyard",
-        description="Scrapyard v3 – production car-parts web scraper",
+        description="Scrapyard v4 – automotive data extraction & enrichment platform",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    # ── Existing flags (unchanged) ────────────────────────────────────────────
     parser.add_argument(
         "--site",
         default=DEFAULT_SITE_SELECTOR,
-        help="Target site identifier from config/sites.yaml, or 'all' to scrape every canonical site concurrently",
+        help="Target site identifier from config/sites.yaml, or 'all'",
     )
     parser.add_argument(
         "--config",
@@ -779,63 +801,99 @@ def build_parser() -> argparse.ArgumentParser:
         "--format",
         default=None,
         choices=["csv", "json", "excel", "sqlite", "postgres", "mysql"],
-        help="Export format. If omitted, the format is inferred from --output or defaults to excel",
+        help="Export format. Defaults to excel",
+    )
+    parser.add_argument("--resume",      action="store_true")
+    parser.add_argument("--incremental", action="store_true")
+    parser.add_argument("--force",       action="store_true")
+    parser.add_argument(
+        "--concurrency", type=int, default=5,
+        help="Max concurrent category / detail-page fetches",
     )
     parser.add_argument(
-        "--resume",
+        "--site-concurrency", type=int, default=0,
+        help="Max concurrent site runs when --site all  (0 = all)",
+    )
+    parser.add_argument("--details",    action="store_true")
+    parser.add_argument("--llm",        action="store_true")
+    parser.add_argument(
+        "--max-pages", type=int, default=DEFAULT_MAX_PAGES, metavar="N",
+    )
+    parser.add_argument("--ignore-ssl", action="store_true")
+    parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+    )
+
+    # ── New Phase-2 flags ─────────────────────────────────────────────────────
+    nlp_group = parser.add_argument_group("NLP enrichment")
+    nlp_group.add_argument(
+        "--no-nlp",
         action="store_true",
-        help="Resume a previous run – skip categories/products already scraped",
+        help="Disable NLP enrichment (language detection, keywords, summarisation, classification)",
     )
-    parser.add_argument(
-        "--incremental",
+
+    export_group = parser.add_argument_group("Export / safety")
+    export_group.add_argument(
+        "--safe-export",
         action="store_true",
-        help="Export only products whose price or stock status changed",
+        help="Write Excel to a temp file first, validate, then rename (prevents IO_WRITE corruption)",
     )
-    parser.add_argument(
-        "--force",
+    export_group.add_argument(
+        "--no-excel-fallback",
         action="store_true",
-        help="Ignore checkpoint skip logic and re-scrape categories",
+        help="Raise an error instead of falling back to CSV when Excel export fails",
     )
-    parser.add_argument(
-        "--concurrency",
-        type=int,
-        default=5,
-        help="Maximum number of concurrent category or detail-page fetches",
+    export_group.add_argument(
+        "--force-csv",
+        action="store_true",
+        help="Always export CSV regardless of --format",
     )
-    parser.add_argument(
-        "--site-concurrency",
+    export_group.add_argument(
+        "--max-rows-per-file",
         type=int,
         default=0,
-        help="Maximum number of concurrent site runs when --site all (0 = run all selected sites in parallel)",
-    )
-    parser.add_argument(
-        "--details",
-        action="store_true",
-        help="Also scrape individual product detail pages (slower)",
-    )
-    parser.add_argument(
-        "--llm",
-        action="store_true",
-        help="Enable LLM (GPT-4o-mini) fallback when CSS selectors return empty values",
-    )
-    parser.add_argument(
-        "--max-pages",
-        type=int,
-        default=DEFAULT_MAX_PAGES,
         metavar="N",
-        help="Maximum pages to scrape per site by default (pass 0 to use the per-site config value)",
+        help="Split large exports into multiple files when products exceed N rows (0 = unlimited)",
     )
-    parser.add_argument(
-        "--ignore-ssl",
+    export_group.add_argument(
+        "--quality-report",
         action="store_true",
-        help="Disable SSL certificate verification",
+        help="Generate a data-quality JSON report alongside the output file",
     )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity",
+
+    scrape_group = parser.add_argument_group("Scraping strategy")
+    scrape_group.add_argument(
+        "--api-first",
+        action="store_true",
+        default=True,
+        help="Prefer Shopify /products.json API over HTML scraping (default: on)",
     )
+    scrape_group.add_argument(
+        "--html-only",
+        action="store_true",
+        help="Force HTML scraping even on Shopify sites (disables API fast-path)",
+    )
+    scrape_group.add_argument(
+        "--max-api-pages",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Cap the number of Shopify API pages per category (0 = use --max-pages)",
+    )
+
+    jina_group = parser.add_argument_group("Jina AI fallback")
+    jina_group.add_argument(
+        "--enable-jina",
+        action="store_true",
+        help="Enable Jina AI fallback (requires JINA_API_KEY in .env)",
+    )
+    jina_group.add_argument(
+        "--disable-jina",
+        action="store_true",
+        help="Disable Jina AI fallback even if JINA_API_KEY is set",
+    )
+
     return parser
 
 
@@ -844,11 +902,24 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_safe_export(args: argparse.Namespace) -> bool:
+    """safe_mode is on when --safe-export is explicitly set, or always for large runs."""
+    return getattr(args, "safe_export", False) or getattr(args, "max_rows_per_file", 0) > 0
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
     _configure_logging(args.log_level)
+
+    # Log Jina status once at startup
+    from utils.jina import log_jina_status
+    from utils.env_loader import validate_env
+    log_jina_status()
+    env_status = validate_env()
+    if env_status.get("JINA_API_KEY") == "missing":
+        logger.debug("JINA_API_KEY not set; Jina fallback disabled")
 
     config_path = Path(args.config)
     if not config_path.exists():
